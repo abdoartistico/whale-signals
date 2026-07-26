@@ -51,9 +51,11 @@ def main(argv=None):
 
     channel = os.environ.get("SOURCE_CHANNEL") or cfg.get("source_channel", "WhaleTracker")
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    # TELEGRAM_CHAT_ID accepts one id or a comma-separated list, so the same signal
+    # can go to your channel and a few private chats at once.
+    chat_ids = [c.strip() for c in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if c.strip()]
 
-    if not args.dry_run and not (token and chat_id):
+    if not args.dry_run and not (token and chat_ids):
         print("error: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set", file=sys.stderr)
         return 2
 
@@ -103,11 +105,18 @@ def main(argv=None):
             print(f"\n=== msg {msg_id} · {sig.symbol} · {s.direction} · template '{TEMPLATE_NAMES[idx % len(TEMPLATE_NAMES)]}' ===")
             print(text_out)
         else:
-            res = telegram.send_message(token, chat_id, text_out)
-            if not res.get("ok"):
-                print(f"  send failed for {sig.symbol}: {res.get('description')}", file=sys.stderr)
+            delivered = 0
+            for cid in chat_ids:
+                res = telegram.send_message(token, cid, text_out)
+                if res.get("ok"):
+                    delivered += 1
+                else:
+                    # one bad recipient (blocked the bot, left the channel) must not
+                    # stop delivery to everyone else
+                    print(f"  send failed for {sig.symbol} -> {cid}: {res.get('description')}", file=sys.stderr)
+            if not delivered:
                 continue
-            print(f"  sent {sig.symbol} ({s.direction}) as '{TEMPLATE_NAMES[idx % len(TEMPLATE_NAMES)]}'")
+            print(f"  sent {sig.symbol} ({s.direction}) as '{TEMPLATE_NAMES[idx % len(TEMPLATE_NAMES)]}' to {delivered}/{len(chat_ids)} chat(s)")
             time.sleep(cfg.get("seconds_between_sends", 3))
 
         state["template_index"] = idx + 1
