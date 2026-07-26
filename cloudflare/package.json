@@ -1,0 +1,5 @@
+{
+  "name": "whale-signals-worker",
+  "private": true,
+  "type": "module"
+}

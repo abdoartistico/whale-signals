@@ -1,0 +1,22 @@
+name = "whale-signals"
+main = "src/worker.js"
+compatibility_date = "2026-07-01"
+
+# Every 2 minutes. Cron Triggers support 1-minute granularity, but the free plan
+# allows 1,000 KV writes/day -- 1-minute runs (1,440/day) could exceed that,
+# while 2-minute runs cannot.
+[triggers]
+crons = ["*/2 * * * *"]
+
+[vars]
+SOURCE_CHANNEL = "WhaleTracker"
+
+# Created by:  npx wrangler kv namespace create STATE
+# Paste the returned id below.
+[[kv_namespaces]]
+binding = "STATE"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+
+# Secrets are NOT stored here. Set them with:
+#   npx wrangler secret put TELEGRAM_BOT_TOKEN
+#   npx wrangler secret put TELEGRAM_CHAT_ID
