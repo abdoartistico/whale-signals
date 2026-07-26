@@ -15,7 +15,7 @@ SOURCE_CHANNEL = "WhaleTracker"
 # Paste the returned id below.
 [[kv_namespaces]]
 binding = "STATE"
-id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+id = "16ca5156a4574f168667bf58fab230c2"
 
 # Secrets are NOT stored here. Set them with:
 #   npx wrangler secret put TELEGRAM_BOT_TOKEN
