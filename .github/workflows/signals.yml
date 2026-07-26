@@ -2,9 +2,10 @@ name: WhaleTracker signals
 
 on:
   schedule:
-    # Every 5 minutes -- the platform minimum, and free because this repo is public.
-    # GitHub still delays scheduled runs by 5-15 min under load, so expect 5-20 min latency.
-    - cron: "*/5 * * * *"
+    # Every 5 minutes, offset to :02 :07 :12 ... instead of :00 :05 :10.
+    # GitHub's scheduler is busiest exactly on the hour and delays or drops runs then,
+    # so an off-the-hour offset measurably improves reliability.
+    - cron: "2-59/5 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:
