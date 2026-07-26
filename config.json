@@ -1,0 +1,30 @@
+{
+  "source_channel": "WhaleTracker",
+
+  "_comment_filters": "OFF by default -- every alert in the channel gets forwarded. Flip enable_filters to true if it ever gets too noisy; the thresholds below only apply then.",
+  "enable_filters": false,
+  "min_alert_volume": 200000,
+  "min_24h_volume": 5000000,
+  "min_side_dominance": 75,
+  "require_net_vol_15m": true,
+  "require_net_vol_1h": true,
+  "require_net_vol_4h": false,
+  "max_price_move_pct": 3.0,
+  "min_alerts_4h": 0,
+  "usdt_pairs_only": false,
+  "exclude_stablecoins": false,
+  "allow_shorts": true,
+  "whitelist": [],
+  "blacklist": [],
+
+  "_comment_levels": "Entry/stop/targets are derived from the last price, in percent.",
+  "entry_zone_pct": 0.4,
+  "stop_loss_pct": 5.0,
+  "take_profit_pcts": [4.0, 8.0, 12.0],
+
+  "_comment_pacing": "Rate control lives here and in the cron interval, not in filtering. The channel averages ~36 alerts/hour, so ~3 arrive per 5-minute run.",
+  "cooldown_minutes_per_coin": 0,
+  "max_signals_per_run": 40,
+  "seconds_between_sends": 3,
+  "max_pages": 4
+}

@@ -1,0 +1,54 @@
+name: WhaleTracker signals
+
+on:
+  schedule:
+    # Every 5 minutes -- the platform minimum, and free because this repo is public.
+    # GitHub still delays scheduled runs by 5-15 min under load, so expect 5-20 min latency.
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Print signals instead of sending them"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+# never let two runs post at the same time
+concurrency:
+  group: signals
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Send signals
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SOURCE_CHANNEL: ${{ vars.SOURCE_CHANNEL || 'WhaleTracker' }}
+        run: |
+          python -m bot.main ${{ inputs.dry_run && '--dry-run' || '' }} --verbose
+
+      - name: Persist state
+        if: ${{ !inputs.dry_run }}
+        run: |
+          if [[ -n "$(git status --porcelain state.json)" ]]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add state.json
+            git commit -m "state: last_id $(python -c "import json;print(json.load(open('state.json'))['last_id'])")"
+            # another run may have pushed while we worked
+            git pull --rebase --autostash origin ${{ github.ref_name }} || true
+            git push
+          else
+            echo "no state change"
+          fi
