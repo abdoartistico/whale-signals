@@ -147,8 +147,16 @@ signal typically reaches you **5–20 minutes after** it fires in the channel. T
 inherent to free serverless cron and cannot be tuned away; beating it requires an always-on
 server.
 
-The channel averages **~36 alerts/hour (~850/day)**, so expect roughly 3 messages per run
-with filtering off — comfortably inside Telegram's rate limits.
+Measured over a 5-hour sample (120 messages), the channel averages **~24 alerts/hour
+(~570/day)**, arriving in bursts of up to 4 per minute. That is roughly **2 messages per
+5-minute run** — about 10x under Telegram's ~20/min ceiling.
+
+Bursts are handled by catch-up, not by sampling: each run processes *every* message since
+the last recorded id, paging back up to 80 messages, so a delayed or skipped run loses
+nothing.
+
+Note that ~1 in 120 alerts uses a non-Latin ticker (e.g. `#币安人生USDT`). Those are skipped
+by design — the ticker pattern only accepts A-Z and 0-9.
 
 ---
 
