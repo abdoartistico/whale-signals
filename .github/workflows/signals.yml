@@ -1,11 +1,17 @@
 name: WhaleTracker signals
 
+# RETIRED as an automatic job. Production runs on Cloudflare Workers -- see
+# cloudflare/README.md. The `schedule:` trigger has been REMOVED on purpose:
+#
+#   1. GitHub's scheduler never fired a single run on this repo, while manual
+#      dispatch worked every time.
+#   2. If it ever did fire alongside the Worker, every signal would be sent twice
+#      (the two keep completely separate state and cannot see each other).
+#
+# Manual dispatch is kept as an emergency fallback if Cloudflare is ever down:
+#   gh workflow enable "WhaleTracker signals" && gh workflow run "WhaleTracker signals"
+# Disable it again afterwards.
 on:
-  schedule:
-    # Every 5 minutes, offset to :02 :07 :12 ... instead of :00 :05 :10.
-    # GitHub's scheduler is busiest exactly on the hour and delays or drops runs then,
-    # so an off-the-hour offset measurably improves reliability.
-    - cron: "2-59/5 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:
