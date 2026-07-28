@@ -1,8 +1,20 @@
-# WhaleTracker → Telegram signal bot
+# Crypto signal bot → Telegram
 
-Reads every alert from the public [@WhaleTracker](https://t.me/WhaleTracker) channel,
-turns each one into a formatted trade setup (entry zone, stop loss, TP1–TP3), and posts
-it to your own Telegram. Runs on GitHub Actions on a schedule.
+Reads every alert from two public Telegram channels, turns each one into a formatted trade
+setup (entry zone, stop loss, TP1–TP3), and posts it to your own Telegram.
+
+| Source | Format | Rate |
+|---|---|---|
+| [@WhaleTracker](https://t.me/WhaleTracker) | order-flow volume alerts | ~24/hour |
+| [@cointrendz_pumpdetector](https://t.me/cointrendz_pumpdetector) | pump detection | ~1/hour |
+
+The two publish completely different data, so each has its own parser and its own
+commentary pool — the pump channel reports no buy/sell dominance or net volume, and the
+templates never claim figures a source didn't publish.
+
+> **Production runs on Cloudflare Workers** (`cloudflare/`), every 2 minutes. This Python
+> version is the fallback; its GitHub Actions schedule is deliberately removed. See
+> `cloudflare/README.md`.
 
 **No server. No paid service. No API keys except a free bot token.**
 

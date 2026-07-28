@@ -50,6 +50,7 @@ def decimals_of(raw):
 @dataclass
 class Signal:
     msg_id: int = 0
+    source: str = "whaletracker"
     symbol: str = ""              # AAVEUSDT
     base: str = ""                # AAVE
     quote: str = ""               # USDT / BTC
@@ -70,6 +71,12 @@ class Signal:
     alerts_24h: int = 0
     alerts_4h: int = 0
     raw: str = ""
+    # cointrendz_pumpdetector only
+    exchange: str = ""
+    price_from: float = 0.0
+    price_from_raw: str = ""
+    vol_change_pct: float = None
+    vol_increase: float = 0.0
 
     @property
     def direction(self):
@@ -159,6 +166,64 @@ def parse_message(text, msg_id=0):
         sig.alerts_24h, sig.alerts_4h = int(m.group(1)), int(m.group(2))
 
     return sig
+
+
+# --- cointrendz_pumpdetector ---------------------------------------------------
+# Format:
+#   🚀 Pump - REZ/USDT [Binance]
+#   Pump Activity on REZ/USDT 🟢🟢
+#   💰Price: $0.00262 ➜ $0.00296 (+13.11%)
+#   📊Volume: $1.85M (+137.42%)
+#   Volume increased by $1.07M ⬆
+#
+# These fire AFTER the move, so price_move_pct is typically large. Promotional posts
+# carry no price line and fall out as None.
+_RE_PD_HEAD = re.compile(r"(Pump|Dump)\s*-\s*([A-Z0-9]+)/([A-Z]+)\s*(?:\[([^\]]+)\])?", re.I)
+_RE_PD_PRICE = re.compile(r"Price:\s*\$?([\d.,]+)\s*(?:➜|->|→)\s*\$?([\d.,]+)\s*\(([-+]?[\d.]+)%\)")
+_RE_PD_VOL = re.compile(r"Volume:\s*\$?([\d.,]+[KMBT]?)\s*(?:\(([-+]?[\d.]+)%\))?")
+_RE_PD_VOLINC = re.compile(r"Volume (?:increased|decreased) by\s*\$?([\d.,]+[KMBT]?)", re.I)
+
+
+def parse_pump_detector(text, msg_id=0):
+    """Return a Signal for a cointrendz_pumpdetector alert, or None."""
+    head = _RE_PD_HEAD.search(text)
+    if not head:
+        return None
+    price = _RE_PD_PRICE.search(text)
+    if not price:
+        return None
+
+    sig = Signal(msg_id=msg_id, source="pumpdetector", raw=text)
+    sig.base = head.group(2).upper()
+    sig.quote = head.group(3).upper()
+    sig.exchange = head.group(4) or ""
+    sig.symbol = sig.base + sig.quote
+    sig.side = "buy" if head.group(1).lower() == "pump" else "sell"
+
+    sig.price_from_raw = price.group(1)
+    sig.price_raw = price.group(2)
+    sig.price_from = to_number(price.group(1)) or 0.0
+    sig.price = to_number(price.group(2)) or 0.0
+    sig.price_move_pct = float(price.group(3))
+    if sig.price <= 0:
+        return None
+
+    vol = _RE_PD_VOL.search(text)
+    if vol:
+        sig.vol24h = to_number(vol.group(1)) or 0.0
+        sig.vol_change_pct = float(vol.group(2)) if vol.group(2) is not None else None
+
+    inc = _RE_PD_VOLINC.search(text)
+    sig.vol_increase = (to_number(inc.group(1)) or 0.0) if inc else 0.0
+    sig.alert_volume = sig.vol_increase
+    return sig
+
+
+PARSERS = {"whaletracker": parse_message, "pumpdetector": parse_pump_detector}
+SOURCES = [
+    {"key": "whaletracker", "channel": "WhaleTracker"},
+    {"key": "pumpdetector", "channel": "cointrendz_pumpdetector"},
+]
 
 
 # --- channel scraping ----------------------------------------------------------

@@ -8,8 +8,11 @@ compatibility_date = "2026-07-01"
 [triggers]
 crons = ["*/2 * * * *"]
 
-[vars]
-SOURCE_CHANNEL = "WhaleTracker"
+# Sources are declared in the SOURCES array in src/worker.js and all run each tick.
+# SOURCE_CHANNEL is intentionally NOT set: when present it restricts a run to that one
+# channel, which is only useful for debugging a single source.
+# [vars]
+# SOURCE_CHANNEL = "WhaleTracker"
 
 # Created by:  npx wrangler kv namespace create STATE
 # Paste the returned id below.

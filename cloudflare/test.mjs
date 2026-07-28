@@ -1,6 +1,6 @@
 /** Verify the Worker port matches the Python bot. Run: node cloudflare/test.mjs */
 
-import { parseMessage, buildSetup, render, TEMPLATE_NAMES } from "./src/worker.js";
+import { parseMessage, parsePumpDetector, buildSetup, render, TEMPLATE_NAMES, extractPosts } from "./src/worker.js";
 
 const AAVE = `┌ #AAVEUSDT ✳️ Buying Volume
 ├ 203.96K ₮ volume in 1m
@@ -87,6 +87,68 @@ for (let i = 0; i < TEMPLATE_NAMES.length; i++) {
 }
 eq("rotation wraps", render(s, 0, 1), render(s, 7, 1));
 eq("neighbours differ", render(s, 0, 1) === render(s, 1, 2), false);
+
+// --- second source: cointrendz_pumpdetector ---
+const PUMP = `🚀 Pump - REZ/USDT [Binance]
+Pump Activity on REZ/USDT 🟢🟢
+💰Price: $0.00262 ➜ $0.00296 (+13.11%)
+📊Volume: $1.85M (+137.42%)
+Volume increased by $1.07M ⬆`;
+
+const p = parsePumpDetector(PUMP, 100);
+eq("pump base", p.base, "REZ");
+eq("pump quote", p.quote, "USDT");
+eq("pump symbol", p.symbol, "REZUSDT");
+eq("pump exchange", p.exchange, "Binance");
+eq("pump side", p.side, "buy");
+eq("pump direction", p.direction, "LONG");
+eq("pump priceFrom", p.priceFrom, 0.00262);
+eq("pump price", p.price, 0.00296);
+eq("pump move", p.priceMovePct, 13.11);
+eq("pump vol24h", p.vol24h, 1850000);
+eq("pump volChangePct", p.volChangePct, 137.42);
+eq("pump volIncrease", p.volIncrease, 1070000);
+eq("pump source tag", p.source, "pumpdetector");
+
+// promotional posts and off-format messages must fall out, not throw
+eq("promo post -> null", parsePumpDetector("✨Bot Command Showcase✨\n\nFeatured command: /fed 🔥", 101), null);
+eq("wt message not parsed as pump", parsePumpDetector(AAVE, 102), null);
+eq("pump message not parsed as wt", parseMessage(PUMP, 103), null);
+
+const ps = buildSetup(p, CFG);
+eq("pump ticker", ps.ticker, "$REZ");
+eq("pump direction kept", ps.direction, "LONG");
+eq("pump stop below price", Number(ps.stop) < p.price, true);
+eq("pump targets ascend", ps.targets.map(Number).every((v, i, a) => i === 0 || v > a[i - 1]), true);
+// tiny price must keep meaningful precision, not collapse to 0.00
+eq("pump precision", ps.targets[0], "0.003078");
+
+// every template must render this source without leaking undefined/NaN
+for (let i = 0; i < TEMPLATE_NAMES.length; i++) {
+  const out = render(ps, i, i);
+  if (out.includes("undefined") || out.includes("NaN") || out.includes("n/a"))
+    fails.push(`pump template ${TEMPLATE_NAMES[i]} leaked a missing field:\n${out}`);
+  if ((out.match(/\*/g) || []).length % 2) fails.push(`pump template ${TEMPLATE_NAMES[i]} unbalanced bold`);
+  // must not claim order-flow stats this source never publishes
+  if (/dominance|Net volume/i.test(out))
+    fails.push(`pump template ${TEMPLATE_NAMES[i]} claims order-flow data that does not exist:\n${out}`);
+}
+
+// --- regression: the pump channel emits "$" as the numeric entity &#036;.
+// Decoding only named entities silently broke every price regex on that source.
+const ENTITY_HTML =
+  '<div data-post="c/9"><div class="tgme_widget_message_text js-message_text" dir="auto">' +
+  "<b>🚀 Pump</b> - REZ/USDT [Binance]<br/>💰Price: &#036;0.00262 ➜ &#036;0.00296 (+13.11%)<br/>" +
+  "📊Volume: &#036;1.85M (+137.42%)<br/>Volume increased by &#036;1.07M ⬆</div></div>";
+const [[eid, etext]] = extractPosts(ENTITY_HTML);
+eq("numeric entity decoded to $", etext.includes("$0.00262"), true);
+eq("no raw entity left behind", etext.includes("&#036;"), false);
+const ep = parsePumpDetector(etext, eid);
+eq("entity-encoded message still parses", ep && ep.price, 0.00296);
+eq("entity-encoded volume still parses", ep && ep.vol24h, 1850000);
+
+// hex entities too
+eq("hex entity decoded", extractPosts('<div data-post="c/1"><div class="js-message_text">&#x24;5</div></div>')[0][1], "$5");
 
 if (fails.length) {
   console.log("FAILED:");

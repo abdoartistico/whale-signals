@@ -24,10 +24,46 @@ def _net(sig, tf):
     return sig.net_vol.get(tf)
 
 
+def _signed(v, d=2):
+    return f"{'+' if v > 0 else ''}{v:.{d}f}%"
+
+
 def _facts(s):
-    """Human-readable fragments built from the actual alert data."""
+    """Human-readable fragments built from the actual alert data.
+
+    The two sources publish different things, so `stat_line` and `bullets` are
+    built per-source; templates use those rather than raw fields, which keeps all
+    seven layouts working for both without claiming data that does not exist.
+    """
     sig = s.signal
     side_word = "Buy" if sig.side == "buy" else "Sell"
+    f = _base_facts(s, sig, side_word)
+
+    if sig.source == "pumpdetector":
+        vol_ch = "" if sig.vol_change_pct is None else f" ({_signed(sig.vol_change_pct, 0)})"
+        f["stat_line"] = (
+            f"📈 Move {f['move']}  ·  Vol {f['vol24']}{vol_ch}"
+            + (f"  ·  {sig.exchange}" if sig.exchange else "")
+        )
+        f["bullets"] = [
+            f"Price jumped {f['move']} from ${sig.price_from_raw} to ${sig.price_raw}",
+            f"Volume at {f['vol24']}" if sig.vol_change_pct is None
+            else f"Volume up {_signed(sig.vol_change_pct, 0)} to {f['vol24']}",
+            f"{money(sig.vol_increase, sig.quote)} of fresh volume"
+            + (f" on {sig.exchange}" if sig.exchange else ""),
+        ]
+    else:
+        f["stat_line"] = f"📈 24h {f['ch24']:+.2f}%  ·  4h {f['ch4']:+.2f}%  ·  Vol {f['vol24']}"
+        pct = lambda v: "n/a" if v is None else f"{v:+.0f}%"  # noqa: E731
+        f["bullets"] = [
+            f"{f['dom']} {side_word.lower()}-side dominance on {f['vol']} in {f['window']}",
+            f"Net volume 15m {pct(f['n15'])} · 1h {pct(f['n1h'])}",
+            f"{f['vol24']} traded in 24h · {f['alerts24_txt']} today",
+        ]
+    return f
+
+
+def _base_facts(s, sig, side_word):
     return {
         "dom": f"{sig.dominance:.0f}%",
         "side_word": side_word,
@@ -42,6 +78,7 @@ def _facts(s):
         "n4h": _net(sig, "4h"),
         "alerts4": sig.alerts_4h,
         "alerts24": sig.alerts_24h,
+        "move": _signed(sig.price_move_pct or 0.0),
         "alerts4_txt": _plural(sig.alerts_4h, f"{side_word.lower()} alert"),
         "alerts24_txt": _plural(sig.alerts_24h, "alert"),
     }
@@ -74,8 +111,32 @@ SHORT_NOTES = [
 ]
 
 
+# The pump channel publishes no order-flow data, so it gets commentary that only
+# claims what its messages actually contain.
+PUMP_NOTES = [
+    "Price jumped {move} on {vol24} of volume. Momentum is live — the move is already underway, so the entry zone matters more than usual.",
+    "Sharp expansion: {move} with volume at {vol24}. Buyers are paying up, and continuation depends on this level holding.",
+    "Volume-driven breakout, {move} with fresh participation stepping in. Watch for a hold above the entry zone rather than chasing the wick.",
+    "A {move} impulse backed by real turnover. Strong moves often extend, but late entries carry the most risk — respect the stop.",
+    "Buyers took control fast: {move} on {vol24}. If price consolidates above the zone instead of fading, continuation is on the table.",
+    "Fresh volume is driving this {move} move. Interest is clearly picking up, though the first leg has already played out.",
+    "Breakout in progress — {move} with volume confirming. The zone below is where the move either holds or fails.",
+    "Momentum ignition: {move}, volume expanding. Treat the entry zone as the line in the sand for this setup.",
+]
+
+DUMP_NOTES = [
+    "Price broke down {move} on {vol24} of volume. Sellers are in control and bounces are being absorbed.",
+    "Sharp flush: {move} with volume at {vol24}. Supply is heavy and the level below is now resistance.",
+    "Volume-driven breakdown, {move}. Momentum is lower while price stays beneath the entry zone.",
+    "A {move} impulse to the downside backed by real turnover. Late shorts carry the most risk — respect the stop.",
+]
+
+
 def note_for(s, seed):
-    pool = LONG_NOTES if s.direction == "LONG" else SHORT_NOTES
+    if s.signal.source == "pumpdetector":
+        pool = PUMP_NOTES if s.direction == "LONG" else DUMP_NOTES
+    else:
+        pool = LONG_NOTES if s.direction == "LONG" else SHORT_NOTES
     return pool[seed % len(pool)].format(**_facts(s))
 
 
@@ -167,7 +228,7 @@ def t_card(s, note):
         f"`TP2   `  {s.targets[1]}\n"
         f"`TP3   `  {s.targets[2]}\n"
         f"`R:R   `  1 : {s.rr}\n\n"
-        f"📈 24h {f['ch24']:+.2f}%  ·  4h {f['ch4']:+.2f}%  ·  Vol {f['vol24']}\n\n"
+        f"{f['stat_line']}\n\n"
         f"{note}\n\n"
         f"*{s.ticker}*"
     )
@@ -175,14 +236,11 @@ def t_card(s, note):
 
 def t_checklist(s, note):
     f = _facts(s)
-    n15 = f"{f['n15']:+.0f}%" if f["n15"] is not None else "n/a"
-    n1h = f"{f['n1h']:+.0f}%" if f["n1h"] is not None else "n/a"
+    bullets = "\n".join(f"✅ {b}" for b in f["bullets"])
     return (
         f"{s.emoji} *{s.ticker} · {s.direction}*\n\n"
         f"*Why this setup:*\n"
-        f"✅ {f['dom']} {f['side_word'].lower()}-side dominance on {f['vol']} in {f['window']}\n"
-        f"✅ Net volume 15m {n15} · 1h {n1h}\n"
-        f"✅ {f['vol24']} traded in 24h · {f['alerts24_txt']} today\n\n"
+        f"{bullets}\n\n"
         f"*The plan:*\n"
         f"📍 Entry  {s.entry_low} – {s.entry_high}\n"
         f"🛡️ Stop   {s.stop}\n"

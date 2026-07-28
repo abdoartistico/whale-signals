@@ -4,6 +4,25 @@ Same bot, same seven templates, same levels — but on Cloudflare's scheduler in
 GitHub's. Runs **every 2 minutes**, reliably, instead of GitHub's "whenever the queue feels
 like it".
 
+## Sources
+
+Both channels are polled every tick, each with independent state in KV, so one going quiet
+or failing never blocks the other:
+
+| Key | Channel | Notes |
+|---|---|---|
+| `whaletracker` | [@WhaleTracker](https://t.me/WhaleTracker) | order-flow alerts, ~24/hour |
+| `pumpdetector` | [@cointrendz_pumpdetector](https://t.me/cointrendz_pumpdetector) | pump alerts, ~1/hour, Binance only |
+
+Add another by appending to `SOURCES` in `src/worker.js` and registering a parser in
+`PARSERS`. Each source needs its own parser and commentary pool — the templates render
+whatever `statLine`/`bullets` the source's `facts()` branch produces, so a new source never
+inherits claims about data it doesn't publish.
+
+**Gotcha worth knowing:** the pump channel encodes `$` as the numeric HTML entity `&#036;`.
+`stripHtml` decodes numeric and hex entities for this reason; decoding only named entities
+silently breaks every price regex on that source. There is a regression test for it.
+
 Why this exists: GitHub assigns scheduled workflows to priority queues based on account age
 and repo history. A new account/repo lands in a heavily throttled queue where runs are
 delayed by hours or dropped outright, and changing the cron expression does not help.

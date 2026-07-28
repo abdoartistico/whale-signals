@@ -1,5 +1,6 @@
 {
-  "source_channel": "WhaleTracker",
+  "_comment_sources": "Both channels in bot/parser.py SOURCES run every pass. Set source_channel to one channel name to restrict a run to it (debugging only); leave empty for all.",
+  "source_channel": "",
 
   "_comment_filters": "OFF by default -- every alert in the channel gets forwarded. Flip enable_filters to true if it ever gets too noisy; the thresholds below only apply then.",
   "enable_filters": false,

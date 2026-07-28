@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 from . import filters, telegram
-from .parser import fetch_new_messages, parse_message
+from .parser import PARSERS, SOURCES, fetch_new_messages
 from .setup import build_setup
 from .templates import TEMPLATE_NAMES, render
 
@@ -48,8 +48,12 @@ def main(argv=None):
 
     cfg = load_json(CONFIG_PATH, {})
     state = load_json(STATE_PATH, {"last_id": 0, "template_index": 0, "cooldown": {}, "sent_total": 0})
+    state.setdefault("channels", {})
+    # migrate the single-source layout that predates the pump channel
+    if state.get("last_id") and "whaletracker" not in state["channels"]:
+        state["channels"]["whaletracker"] = state["last_id"]
 
-    channel = os.environ.get("SOURCE_CHANNEL") or cfg.get("source_channel", "WhaleTracker")
+    only = os.environ.get("SOURCE_CHANNEL") or cfg.get("source_channel", "")
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     # TELEGRAM_CHAT_ID accepts one id or a comma-separated list, so the same signal
     # can go to your channel and a few private chats at once.
@@ -59,73 +63,81 @@ def main(argv=None):
         print("error: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set", file=sys.stderr)
         return 2
 
-    last_id = int(state.get("last_id", 0))
-    messages = fetch_new_messages(channel, since_id=last_id, max_pages=cfg.get("max_pages", 3))
-    print(f"fetched {len(messages)} new message(s) from @{channel} (since id {last_id})")
-
     now = time.time()
     cooldown = state.get("cooldown", {})
     cd_seconds = cfg.get("cooldown_minutes_per_coin", 240) * 60
     limit = args.limit if args.limit is not None else cfg.get("max_signals_per_run", 3)
 
+    sources = [s for s in SOURCES if not only or s["channel"] == only]
     sent, candidates = 0, 0
-    highest = last_id
 
-    for msg_id, text in messages:
-        highest = max(highest, msg_id)
-        sig = parse_message(text, msg_id)
-        if not sig:
+    for src in sources:
+        since = int(state["channels"].get(src["key"], 0))
+        try:
+            messages = fetch_new_messages(src["channel"], since_id=since, max_pages=cfg.get("max_pages", 3))
+        except Exception as exc:  # one dead source must not stop the other
+            print(f"  {src['key']}: fetch failed ({exc})", file=sys.stderr)
             continue
-        candidates += 1
+        print(f"fetched {len(messages)} new message(s) from @{src['channel']} (since id {since})")
+        highest = since
 
-        if cfg.get("enable_filters", False) and not args.all:
-            ok, reason = filters.check(sig, cfg)
-            if not ok:
-                if args.verbose:
-                    print(f"  skip {sig.symbol:<14} {reason}")
+        for msg_id, text in messages:
+            highest = max(highest, msg_id)
+            sig = PARSERS[src["key"]](text, msg_id)
+            if not sig:
                 continue
+            candidates += 1
 
-            if cd_seconds:
-                last_sent = cooldown.get(sig.base, 0)
-                if now - last_sent < cd_seconds:
-                    mins = (cd_seconds - (now - last_sent)) / 60
+            if cfg.get("enable_filters", False) and not args.all:
+                ok, reason = filters.check(sig, cfg)
+                if not ok:
                     if args.verbose:
-                        print(f"  skip {sig.symbol:<14} cooldown, {mins:.0f}m left")
+                        print(f"  skip {sig.symbol:<14} {reason}")
                     continue
 
-        if sent >= limit:
-            print(f"  hit max_signals_per_run={limit}; remaining alerts skipped this run")
-            break
+                if cd_seconds:
+                    last_sent = cooldown.get(sig.base, 0)
+                    if now - last_sent < cd_seconds:
+                        mins = (cd_seconds - (now - last_sent)) / 60
+                        if args.verbose:
+                            print(f"  skip {sig.symbol:<14} cooldown, {mins:.0f}m left")
+                        continue
 
-        s = build_setup(sig, cfg)
-        idx = state.get("template_index", 0)
-        text_out = render(s, idx, seed=msg_id)
+            if sent >= limit:
+                print(f"  hit max_signals_per_run={limit}; remaining alerts skipped this run")
+                break
 
-        if args.dry_run:
-            print(f"\n=== msg {msg_id} · {sig.symbol} · {s.direction} · template '{TEMPLATE_NAMES[idx % len(TEMPLATE_NAMES)]}' ===")
-            print(text_out)
-        else:
-            delivered = 0
-            for cid in chat_ids:
-                res = telegram.send_message(token, cid, text_out)
-                if res.get("ok"):
-                    delivered += 1
-                else:
-                    # one bad recipient (blocked the bot, left the channel) must not
-                    # stop delivery to everyone else
-                    print(f"  send failed for {sig.symbol} -> {cid}: {res.get('description')}", file=sys.stderr)
-            if not delivered:
-                continue
-            print(f"  sent {sig.symbol} ({s.direction}) as '{TEMPLATE_NAMES[idx % len(TEMPLATE_NAMES)]}' to {delivered}/{len(chat_ids)} chat(s)")
-            time.sleep(cfg.get("seconds_between_sends", 3))
+            s = build_setup(sig, cfg)
+            idx = state.get("template_index", 0)
+            text_out = render(s, idx, seed=msg_id)
 
-        state["template_index"] = idx + 1
-        cooldown[sig.base] = now
-        sent += 1
+            if args.dry_run:
+                print(f"\n=== {src['key']} msg {msg_id} · {sig.symbol} · {s.direction} · template '{TEMPLATE_NAMES[idx % len(TEMPLATE_NAMES)]}' ===")
+                print(text_out)
+            else:
+                delivered = 0
+                for cid in chat_ids:
+                    res = telegram.send_message(token, cid, text_out)
+                    if res.get("ok"):
+                        delivered += 1
+                    else:
+                        # one bad recipient (blocked the bot, left the channel) must not
+                        # stop delivery to everyone else
+                        print(f"  send failed for {sig.symbol} -> {cid}: {res.get('description')}", file=sys.stderr)
+                if not delivered:
+                    continue
+                print(f"  sent {src['key']} {sig.symbol} ({s.direction}) as '{TEMPLATE_NAMES[idx % len(TEMPLATE_NAMES)]}' to {delivered}/{len(chat_ids)} chat(s)")
+                time.sleep(cfg.get("seconds_between_sends", 3))
+
+            state["template_index"] = idx + 1
+            cooldown[sig.base] = now
+            sent += 1
+
+        state["channels"][src["key"]] = highest
 
     # forget cooldown entries that have long expired
     state["cooldown"] = {k: v for k, v in cooldown.items() if now - v < cd_seconds * 2}
-    state["last_id"] = highest
+    state.pop("last_id", None)  # superseded by state["channels"]
     state["sent_total"] = state.get("sent_total", 0) + (0 if args.dry_run else sent)
 
     print(f"parsed {candidates} alert(s), {'would send' if args.dry_run else 'sent'} {sent}")

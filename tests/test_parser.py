@@ -6,7 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from bot import filters
-from bot.parser import parse_message
+from bot.parser import parse_message, parse_pump_detector
 from bot.setup import build_setup
 from bot.templates import TEMPLATE_NAMES, TEMPLATES, render
 
@@ -138,6 +138,49 @@ for i, name in enumerate(TEMPLATE_NAMES):
 eq("template count", len(TEMPLATES), 7)
 eq("rotation wraps", render(s, 0, seed=1), render(s, len(TEMPLATES), seed=1))
 eq("neighbouring alerts differ", render(s, 0, seed=1) == render(s, 1, seed=2), False)
+
+# --- second source: cointrendz_pumpdetector ---
+PUMP = """🚀 Pump - REZ/USDT [Binance]
+Pump Activity on REZ/USDT 🟢🟢
+💰Price: $0.00262 ➜ $0.00296 (+13.11%)
+📊Volume: $1.85M (+137.42%)
+Volume increased by $1.07M ⬆"""
+
+p = parse_pump_detector(PUMP, 100)
+eq("pump.base", p.base, "REZ")
+eq("pump.quote", p.quote, "USDT")
+eq("pump.symbol", p.symbol, "REZUSDT")
+eq("pump.exchange", p.exchange, "Binance")
+eq("pump.side", p.side, "buy")
+eq("pump.direction", p.direction, "LONG")
+eq("pump.price_from", p.price_from, 0.00262)
+eq("pump.price", p.price, 0.00296)
+eq("pump.move", p.price_move_pct, 13.11)
+eq("pump.vol24h", p.vol24h, 1850000.0)
+eq("pump.vol_change_pct", p.vol_change_pct, 137.42)
+eq("pump.vol_increase", p.vol_increase, 1070000.0)
+eq("pump.source", p.source, "pumpdetector")
+
+eq("promo post -> None", parse_pump_detector("✨Bot Command Showcase✨\n\nFeatured: /fed", 101), None)
+eq("wt msg not parsed as pump", parse_pump_detector(AAVE, 102), None)
+eq("pump msg not parsed as wt", parse_message(PUMP, 103), None)
+
+ps = build_setup(p, CFG)
+eq("pump ticker", ps.ticker, "$REZ")
+eq("pump stop below price", float(ps.stop) < p.price, True)
+eq("pump targets ascend", ps.targets == sorted(ps.targets, key=float), True)
+eq("pump precision kept", ps.targets[0], "0.003078")
+
+# every template must render the pump source without leaking missing fields
+for i, name in enumerate(TEMPLATE_NAMES):
+    out = render(ps, i, seed=i)
+    if "None" in out or "n/a" in out or "{" in out:
+        fails.append(f"pump template {name} leaked a missing field:\n{out}")
+    if out.count("*") % 2:
+        fails.append(f"pump template {name} unbalanced bold")
+    # must not claim order-flow stats this source never publishes
+    if "dominance" in out or "Net volume" in out:
+        fails.append(f"pump template {name} claims data that does not exist:\n{out}")
 
 if fails:
     print("FAILED:")
