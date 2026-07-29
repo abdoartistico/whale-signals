@@ -1,16 +1,12 @@
 # Crypto signal bot → Telegram
 
-Reads every alert from two public Telegram channels, turns each one into a formatted trade
-setup (entry zone, stop loss, TP1–TP3), and posts it to your own Telegram.
+Reads every alert from [@WhaleTracker](https://t.me/WhaleTracker) (~24/hour), turns each
+one into a formatted trade setup (entry zone, stop loss, TP1–TP3), and posts it to your own
+Telegram.
 
-| Source | Format | Rate |
-|---|---|---|
-| [@WhaleTracker](https://t.me/WhaleTracker) | order-flow volume alerts | ~24/hour |
-| [@cointrendz_pumpdetector](https://t.me/cointrendz_pumpdetector) | pump detection | ~1/hour |
-
-The two publish completely different data, so each has its own parser and its own
-commentary pool — the pump channel reports no buy/sell dominance or net volume, and the
-templates never claim figures a source didn't publish.
+A second source, [@cointrendz_pumpdetector](https://t.me/cointrendz_pumpdetector), is
+implemented and tested but **dormant** — re-enable it by adding its entry back to `SOURCES`
+in `bot/parser.py` and `cloudflare/src/worker.js`.
 
 > **Production runs on Cloudflare Workers** (`cloudflare/`), every 2 minutes. This Python
 > version is the fallback; its GitHub Actions schedule is deliberately removed. See
@@ -189,22 +185,35 @@ schedule.
 
 ---
 
-## The seven templates
+## The three templates
 
-Messages rotate through seven layouts, and the commentary line is drawn from eight
-data-driven variants per direction — so consecutive posts never look like the same bot
-output. Rotation state lives in `state.json`.
+Messages rotate through three layouts, and the wording inside each is drawn from
+independent pools so consecutive posts never read the same:
 
-1. **boxed** — `◆ $TICKER (LONG)` with `───` dividers
-2. **plain** — narrative style, "Breaking above X could unlock further upside"
-3. **rocket** — `🚀 $TICKER LONG SETUP 📈🔥` with numbered targets
-4. **headline** — hook headline plus full setup
-5. **card** — `╭━━ TRADE IDEA ━━╮` with monospace level alignment and R:R
-6. **checklist** — "Why this setup" evidence bullets from the real volume data
-7. **minimal** — sparse, no emoji clutter
+1. **setup** — `🔥 LONG SETUP — $COIN` with the 💎 opener and spaced-out levels
+2. **compact** — `$COIN — LONG 🟢` with tight one-per-line levels
+3. **hook** — `$COIN – <hook line>` followed by the plan
 
-Run `python3 preview.py` to see them all. Edit or add templates in `bot/templates.py` —
-append your function to the `TEMPLATES` list at the bottom and it joins the rotation.
+Four rotating slots feed them:
+
+| Slot | Used by | Variants |
+|---|---|---|
+| opener / hook | setup, hook | 24 per direction |
+| closer | compact, hook | 24 per direction |
+| CTA (`… 👇`) | all three | 6 |
+| follow line | setup | 4 |
+
+Measured: **500 consecutive signals produce 412 distinct messages.**
+
+Each slot is drawn with an integer hash of the message id rather than a linear stride.
+That matters — a stride like `seed * salt` makes every slot advance in lockstep, so the
+whole message repeats with a period equal to the pool size (24). The hash makes the draws
+independent. There is a test asserting the slots stay decorrelated.
+
+Templates are **plain text** — no Markdown — so nothing can mis-parse on an odd ticker.
+
+Run `python3 preview.py` to see them. Edit wording pools or layouts in `bot/templates.py`
+(and mirror any change in `cloudflare/src/worker.js`, which is what actually runs).
 
 ---
 

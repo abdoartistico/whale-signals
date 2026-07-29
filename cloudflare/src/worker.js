@@ -20,10 +20,9 @@ const CONFIG = {
 // Each source has its own message format and therefore its own parser and its own
 // commentary pool -- the pump channel publishes none of the order-flow statistics
 // the WhaleTracker templates talk about.
-const SOURCES = [
-  { key: "whaletracker", channel: "WhaleTracker" },
-  { key: "pumpdetector", channel: "cointrendz_pumpdetector" },
-];
+// Only WhaleTracker is active. The pump parser below is kept and tested but dormant --
+// re-enable by adding { key: "pumpdetector", channel: "cointrendz_pumpdetector" } here.
+const SOURCES = [{ key: "whaletracker", channel: "WhaleTracker" }];
 
 const STABLE_BASES = new Set([
   "USDT", "USDC", "RLUSD", "FDUSD", "TUSD", "BUSD", "DAI", "USDE", "USDD",
@@ -259,6 +258,12 @@ function precisionFor(price, refRaw) {
   return dec;
 }
 
+/** 1905.5 -> "1,905.5" -- thousands separators on the integer part only. */
+function withCommas(s) {
+  const [int, frac] = s.split(".");
+  return int.replace(/\B(?=(\d{3})+(?!\d))/g, ",") + (frac ? `.${frac}` : "");
+}
+
 export function buildSetup(sig, cfg) {
   const p = sig.price;
   const zone = cfg.entryZonePct / 100;
@@ -271,7 +276,7 @@ export function buildSetup(sig, cfg) {
   const targets = cfg.takeProfitPcts.map((t) => (long ? p * (1 + t / 100) : p * (1 - t / 100)));
 
   const dec = precisionFor(p, sig.priceRaw);
-  const f = (v) => v.toFixed(dec);
+  const f = (v) => withCommas(v.toFixed(dec));
   const risk = Math.abs(p - stop);
   const reward = Math.abs((targets[1] ?? targets[0]) - p);
 
@@ -290,239 +295,222 @@ export function buildSetup(sig, cfg) {
 }
 
 // ---------------------------------------------------------------- templates
+//
+// Three layouts. Each pulls its wording from rotating pools so consecutive posts
+// never read the same: an opener/hook, a closing sentiment line, a call to action,
+// and (for the SETUP layout) a follow line.
+//
+// 3 layouts x 24 openers x 24 closers x 6 CTAs = ~10k combinations before repeating.
+// Selection is seeded off the message id -- deterministic, but decorrelated per slot
+// so the parts don't advance in lockstep.
+//
+// Plain text on purpose: no Markdown markers, so no parse failures on odd tickers.
 
-function money(v, quote) {
-  const unit = STABLE_QUOTES.has(quote) && quote !== "" ? "$" : "";
-  const suffix = unit ? "" : ` ${quote}`;
-  for (const [div, tag] of [[1e9, "B"], [1e6, "M"], [1e3, "K"]]) {
-    if (Math.abs(v) >= div) return `${unit}${(v / div).toFixed(2)}${tag}${suffix}`;
-  }
-  if (Math.abs(v) < 100) return `${unit}${Number(v.toPrecision(4))}${suffix}`;
-  return `${unit}${Math.round(v).toLocaleString("en-US")}${suffix}`;
+const LONG_OPENERS = [
+  "Strong buying pressure is increasing.",
+  "Momentum is building above support.",
+  "Buyers are stepping in with size.",
+  "Demand is picking up fast.",
+  "Accumulation is showing on the tape.",
+  "Buying volume is expanding.",
+  "Bulls are taking control here.",
+  "Support is holding firm.",
+  "Order flow has flipped bullish.",
+  "Buyers are defending this zone.",
+  "Upside pressure is building.",
+  "A breakout attempt is developing.",
+  "Volume is confirming the move up.",
+  "Dips are being bought aggressively.",
+  "Strength is returning after the pullback.",
+  "Bullish momentum is accelerating.",
+  "Buyers are absorbing the offers.",
+  "Interest is rotating into this pair.",
+  "The trend is turning up.",
+  "Fresh demand is entering the market.",
+  "Price is coiling for a move higher.",
+  "Sellers are running out of steam.",
+  "Higher lows are forming.",
+  "Continuation looks likely from here.",
+];
+
+const SHORT_OPENERS = [
+  "Strong selling pressure is increasing.",
+  "Momentum is breaking down below resistance.",
+  "Sellers are stepping in with size.",
+  "Supply is picking up fast.",
+  "Distribution is showing on the tape.",
+  "Selling volume is expanding.",
+  "Bears are taking control here.",
+  "Resistance is capping every bounce.",
+  "Order flow has flipped bearish.",
+  "Sellers are defending this zone.",
+  "Downside pressure is building.",
+  "A breakdown is developing.",
+  "Volume is confirming the move down.",
+  "Rallies are being sold aggressively.",
+  "Weakness is returning after the bounce.",
+  "Bearish momentum is accelerating.",
+  "Sellers are hitting the bids.",
+  "Money is rotating out of this pair.",
+  "The trend is turning down.",
+  "Fresh supply is entering the market.",
+  "Price is rolling over.",
+  "Buyers are running out of steam.",
+  "Lower highs are forming.",
+  "Continuation lower looks likely from here.",
+];
+
+const LONG_CLOSERS = [
+  "Buying interest remains strong, keeping the bullish trend intact as long as support holds. 📈",
+  "Buyers are defending key levels and momentum stays positive while this zone holds.",
+  "Price is showing strength after the recent dip, with buyers active on every pullback.",
+  "As long as the entry zone holds, continuation toward the targets stays on the table. 📈",
+  "Demand is outpacing supply here, and the structure stays bullish above the stop.",
+  "Momentum favours the upside while price holds above support. 🚀",
+  "Accumulation continues and dips keep getting absorbed by buyers.",
+  "The bullish structure remains valid unless the stop level gives way.",
+  "Buyers are in control and the path of least resistance points higher. 📈",
+  "Strength is building steadily, and a push toward the targets looks reasonable.",
+  "Support has held cleanly, which keeps the upside scenario alive.",
+  "Volume is backing the move, suggesting real interest rather than a fake push.",
+  "The setup stays valid while price consolidates above the entry zone.",
+  "Buyers keep defending, and a continuation move is possible if this level holds. 📈",
+  "Pressure is on the upside, with sellers struggling to push price lower.",
+  "Trend and momentum are aligned to the upside for now. 🚀",
+  "Interest is picking up and the reaction off support has been strong.",
+  "This zone has attracted consistent buying, keeping the bias bullish.",
+  "A hold above the entry zone keeps the targets in play.",
+  "Bulls remain in charge while the stop level stays untouched. 📈",
+  "The pullback looks corrective, with the larger move still pointing up.",
+  "Buyers are absorbing supply, which often precedes an expansion higher.",
+  "Momentum remains constructive as long as the structure holds.",
+  "Risk stays defined at the stop while the upside targets remain open. 📈",
+];
+
+const SHORT_CLOSERS = [
+  "Selling interest remains strong, keeping the bearish trend intact as long as resistance holds. 📉",
+  "Sellers are defending key levels and momentum stays negative while this zone caps price.",
+  "Price is showing weakness after the recent bounce, with sellers active on every rally.",
+  "As long as price stays under the entry zone, continuation toward the targets stays on the table. 📉",
+  "Supply is outpacing demand here, and the structure stays bearish below the stop.",
+  "Momentum favours the downside while price holds below resistance. 🔻",
+  "Distribution continues and rallies keep getting sold.",
+  "The bearish structure remains valid unless the stop level is reclaimed.",
+  "Sellers are in control and the path of least resistance points lower. 📉",
+  "Weakness is building steadily, and a push toward the targets looks reasonable.",
+  "Resistance has held cleanly, which keeps the downside scenario alive.",
+  "Volume is backing the move, suggesting real selling rather than a shakeout.",
+  "The setup stays valid while price consolidates below the entry zone.",
+  "Sellers keep pressing, and a continuation move is possible if this level caps price. 📉",
+  "Pressure is on the downside, with buyers struggling to lift price.",
+  "Trend and momentum are aligned to the downside for now. 🔻",
+  "Selling is picking up and the rejection from resistance has been clean.",
+  "This zone has attracted consistent selling, keeping the bias bearish.",
+  "Staying below the entry zone keeps the targets in play.",
+  "Bears remain in charge while the stop level holds. 📉",
+  "The bounce looks corrective, with the larger move still pointing down.",
+  "Sellers are absorbing bids, which often precedes an expansion lower.",
+  "Momentum remains weak as long as the structure holds.",
+  "Risk stays defined at the stop while the downside targets remain open. 📉",
+];
+
+const CTAS = [
+  "Open your trade 👇",
+  "Trade from here 👇",
+  "Trade here 👇",
+  "Enter from here 👇",
+  "Take the setup here 👇",
+  "Start your trade 👇",
+];
+
+const FOLLOW_LINES = [
+  "✅ Follow for more high-quality trade setups.",
+  "✅ Follow for more setups like this.",
+  "✅ More high-quality setups posted daily.",
+  "✅ Stay tuned for more premium setups.",
+];
+
+/**
+ * Integer hash, so each slot is picked independently of the others.
+ *
+ * A linear stride (seed * salt) looks varied but makes the slots move in lockstep:
+ * the whole message then repeats with a period equal to the pool size. Hashing gives
+ * each slot an effectively independent draw, so combinations run into the thousands.
+ */
+function hash32(x) {
+  x = (x ^ 61) ^ (x >>> 16);
+  x = x + (x << 3);
+  x = x ^ (x >>> 4);
+  x = Math.imul(x, 0x27d4eb2d);
+  x = x ^ (x >>> 15);
+  return x >>> 0;
 }
 
-const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
+const pick = (pool, seed, salt) => pool[hash32(Math.imul(seed, 0x9e3779b1) + Math.imul(salt, 0x85ebca6b)) % pool.length];
 
-const signed = (v, d = 2) => `${v > 0 ? "+" : ""}${v.toFixed(d)}%`;
-
-function facts(s) {
-  const g = s.signal;
-  const sideWord = g.side === "buy" ? "Buy" : "Sell";
-  const f = {
-    dom: `${Math.round(g.dominance)}%`,
-    side_word: sideWord,
-    vol: money(g.alertVolume, g.quote),
-    window: g.window,
-    vol24: money(g.vol24h, g.quote),
-    ch24: (g.change["24h"] ?? 0).toFixed(2),
-    ch4: (g.change["4h"] ?? 0).toFixed(2),
-    n15: g.netVol["15m"],
-    n1h: g.netVol["1h"],
-    move: signed(g.priceMovePct ?? 0),
-    alerts4_txt: plural(g.alerts4h, `${sideWord.toLowerCase()} alert`),
-    alerts24_txt: plural(g.alerts24h, "alert"),
+function parts(s, seed) {
+  const long = s.direction === "LONG";
+  return {
+    opener: pick(long ? LONG_OPENERS : SHORT_OPENERS, seed, 1),
+    closer: pick(long ? LONG_CLOSERS : SHORT_CLOSERS, seed, 7),
+    cta: pick(CTAS, seed, 13),
+    follow: pick(FOLLOW_LINES, seed, 5),
   };
-
-  if (g.source === "pumpdetector") {
-    const volCh = g.volChangePct == null ? "" : ` (${signed(g.volChangePct, 0)})`;
-    f.statLine = `📈 Move ${f.move}  ·  Vol ${f.vol24}${volCh}${g.exchange ? `  ·  ${g.exchange}` : ""}`;
-    f.bullets = [
-      `Price jumped ${f.move} from $${g.priceFromRaw} to $${g.priceRaw}`,
-      g.volChangePct == null ? `Volume at ${f.vol24}` : `Volume up ${signed(g.volChangePct, 0)} to ${f.vol24}`,
-      `${money(g.volIncrease, g.quote)} of fresh volume${g.exchange ? ` on ${g.exchange}` : ""}`,
-    ];
-  } else {
-    f.statLine = `📈 24h ${f.ch24}%  ·  4h ${f.ch4}%  ·  Vol ${f.vol24}`;
-    const pct = (v) => (v === undefined ? "n/a" : `${v > 0 ? "+" : ""}${Math.round(v)}%`);
-    f.bullets = [
-      `${f.dom} ${sideWord.toLowerCase()}-side dominance on ${f.vol} in ${f.window}`,
-      `Net volume 15m ${pct(f.n15)} · 1h ${pct(f.n1h)}`,
-      `${f.vol24} traded in 24h · ${f.alerts24_txt} today`,
-    ];
-  }
-  return f;
-}
-
-const LONG_NOTES = [
-  (f) => `${f.side_word} orders took ${f.dom} of a ${f.vol} sweep in ${f.window}. Net volume is holding positive, and buyers keep stepping in above support.`,
-  (f) => `A ${f.vol} buy-side sweep hit in ${f.window} with ${f.dom} of it on the bid. Momentum is building while the ${f.ch24}% daily trend stays intact.`,
-  (f) => `Buyers absorbed the offer with ${f.dom} dominance on ${f.vol} traded in ${f.window}. As long as the entry zone holds, continuation stays on the table.`,
-  (f) => `Aggressive accumulation: ${f.dom} of ${f.vol} in ${f.window} came from the buy side. Net volume turned positive on the 15m and 1h.`,
-  (f) => `Demand is showing up — ${f.vol} in ${f.window}, ${f.dom} of it buying. Price is defending the level and the higher-timeframe trend is still up.`,
-  (f) => `Repeat interest — ${f.alerts4_txt} on this pair in the last 4h, the latest ${f.vol} at ${f.dom} dominance. Clustered demand often precedes expansion.`,
-  (f) => `Order flow flipped bullish: ${f.dom} buy-side on ${f.vol} in ${f.window}, against ${f.vol24} of daily turnover. Watching for follow-through.`,
-  (f) => `Strength after the pullback. Buyers defended the zone with ${f.vol} of demand in ${f.window} and net volume stayed green.`,
-];
-
-const SHORT_NOTES = [
-  (f) => `${f.side_word} orders took ${f.dom} of a ${f.vol} dump in ${f.window}. Sellers are in control while price stays under the entry zone.`,
-  (f) => `A ${f.vol} sell-side sweep hit in ${f.window}, ${f.dom} of it offered. Supply is heavy and the bounce is being sold.`,
-  (f) => `Distribution showing: ${f.dom} of ${f.vol} in ${f.window} came from sellers. Net volume is negative and rallies keep failing.`,
-  (f) => `Sellers pressed ${f.vol} through the book in ${f.window} with ${f.dom} dominance. Momentum stays down unless the stop level reclaims.`,
-  (f) => `Heavy offer into strength — ${f.vol} in ${f.window}, ${f.dom} selling, against ${f.vol24} of daily volume. Continuation lower is favoured.`,
-  (f) => `Persistent supply — ${f.alerts4_txt} on this pair in the last 4h, the latest ${f.vol} at ${f.dom} dominance. It rarely clears in one move.`,
-  (f) => `Bearish order flow: ${f.dom} sell-side on ${f.vol} in ${f.window}. Price is losing the level and buyers are not defending it.`,
-  (f) => `Rejection from the zone. ${f.vol} of supply in ${f.window} with ${f.dom} on the ask, and net volume rolled over.`,
-];
-
-// The pump channel publishes no order-flow data, so it gets its own commentary that
-// only claims what the message actually contains.
-const PUMP_NOTES = [
-  (f) => `Price jumped ${f.move} on ${f.vol24} of volume. Momentum is live — the move is already underway, so the entry zone matters more than usual.`,
-  (f) => `Sharp expansion: ${f.move} with volume at ${f.vol24}. Buyers are paying up, and continuation depends on this level holding.`,
-  (f) => `Volume-driven breakout, ${f.move} with fresh participation stepping in. Watch for a hold above the entry zone rather than chasing the wick.`,
-  (f) => `A ${f.move} impulse backed by real turnover. Strong moves often extend, but late entries carry the most risk — respect the stop.`,
-  (f) => `Buyers took control fast: ${f.move} on ${f.vol24}. If price consolidates above the zone instead of fading, continuation is on the table.`,
-  (f) => `Fresh volume is driving this ${f.move} move. Interest is clearly picking up, though the first leg has already played out.`,
-  (f) => `Breakout in progress — ${f.move} with volume confirming. The zone below is where the move either holds or fails.`,
-  (f) => `Momentum ignition: ${f.move}, volume expanding. Treat the entry zone as the line in the sand for this setup.`,
-];
-
-const DUMP_NOTES = [
-  (f) => `Price broke down ${f.move} on ${f.vol24} of volume. Sellers are in control and bounces are being absorbed.`,
-  (f) => `Sharp flush: ${f.move} with volume at ${f.vol24}. Supply is heavy and the level below is now resistance.`,
-  (f) => `Volume-driven breakdown, ${f.move}. Momentum is lower while price stays beneath the entry zone.`,
-  (f) => `A ${f.move} impulse to the downside backed by real turnover. Late shorts carry the most risk — respect the stop.`,
-];
-
-function noteFor(s, seed) {
-  const pump = s.signal.source === "pumpdetector";
-  const pool = pump
-    ? s.direction === "LONG" ? PUMP_NOTES : DUMP_NOTES
-    : s.direction === "LONG" ? LONG_NOTES : SHORT_NOTES;
-  return pool[seed % pool.length](facts(s));
 }
 
 const TEMPLATES = [
-  function boxed(s, note) {
-    return `◆ *${s.ticker}* (${s.direction}) ${s.emoji}
-───────────────────
-📍 *Entry Zone* : ${s.entryLow} – ${s.entryHigh}
-🛡️ *Stop Loss*  : ${s.stop}
+  function setup(s, p) {
+    return `🔥 ${s.direction} SETUP — ${s.ticker}
 
-🎯 *Take Profit Targets:*
-✦ *TP1* : ${s.targets[0]}
-✦ *TP2* : ${s.targets[1]}
-✦ *TP3* : ${s.targets[2]}
+💎 ${p.opener}
 
-💡 ${note}
-───────────────────
-*${s.ticker}*`;
-  },
-  function plain(s, note) {
-    const long = s.direction === "LONG";
-    return `${s.ticker} — ${long ? "Breaking above" : "Losing"} ${s.targets[0]} ${long ? "could unlock further upside" : "opens the door to further downside"}.
+Entry Zone: ${s.entryLow} – ${s.entryHigh}
 
-${long ? "Long" : "Short"} ${s.ticker}
-
-Entry: ${s.entryLow}–${s.entryHigh}
-SL: ${s.stop}
-
-TP1: ${s.targets[0]}
-TP2: ${s.targets[1]}
-TP3: ${s.targets[2]}
-
-${note}
-
-Trade here 👇
-
-${s.ticker}`;
-  },
-  function rocket(s, note) {
-    return `${s.direction === "LONG" ? "🚀" : "⚡"} *${s.ticker} ${s.direction} SETUP* ${s.arrow}🔥
-
-Entry: ${s.entryLow}–${s.entryHigh}
-
-🎯 *Take Profit Targets*
-1️⃣ TP1: ${s.targets[0]}
-2️⃣ TP2: ${s.targets[1]}
-3️⃣ TP3: ${s.targets[2]}
-
-🛡️ SL: ${s.stop}
-
-━━━━━━━━━━━━━━
-
-📊 ${note}
-
-Trade here 👇
-
-${s.ticker}`;
-  },
-  function headline(s, note) {
-    const long = s.direction === "LONG";
-    return `🚀 *${s.ticker} — ${long ? "Buyers are defending support, more upside possible" : "Sellers are capping every bounce, more downside possible"}* ${s.arrow}🔥
-
-${long ? "Long" : "Short"} ${s.ticker} ${s.emoji}
-
-Entry: ${s.entryLow}–${s.entryHigh}
+🛡️ Stop Loss: ${s.stop}
 
 🎯 Take Profit:
+ TP1: ${s.targets[0]}
+ TP2: ${s.targets[1]}
+ TP3: ${s.targets[2]}
+
+${p.follow}
+
+${p.cta}
+
+${s.ticker}`;
+  },
+
+  function compact(s, p) {
+    return `${s.ticker} — ${s.direction} ${s.emoji}
+Entry: ${s.entryLow} – ${s.entryHigh}
+SL: ${s.stop}
 TP1: ${s.targets[0]}
 TP2: ${s.targets[1]}
 TP3: ${s.targets[2]}
-
-🛡️ SL: ${s.stop}
-
-${note}
-
-Trade here 👇
-
+${p.closer}
+${p.cta}
 ${s.ticker}`;
   },
-  function card(s, note) {
-    const f = facts(s);
-    return `╭━━━ *TRADE IDEA* ━━━╮
-  ${s.ticker}   ·   *${s.direction}* ${s.emoji}
-╰━━━━━━━━━━━━━━━╯
 
-\`Entry \`  ${s.entryLow} – ${s.entryHigh}
-\`Stop  \`  ${s.stop}
-\`TP1   \`  ${s.targets[0]}
-\`TP2   \`  ${s.targets[1]}
-\`TP3   \`  ${s.targets[2]}
-\`R:R   \`  1 : ${s.rr}
-
-${f.statLine}
-
-${note}
-
-*${s.ticker}*`;
-  },
-  function checklist(s, note) {
-    const f = facts(s);
-    return `${s.emoji} *${s.ticker} · ${s.direction}*
-
-*Why this setup:*
-${f.bullets.map((b) => `✅ ${b}`).join("\n")}
-
-*The plan:*
-📍 Entry  ${s.entryLow} – ${s.entryHigh}
-🛡️ Stop   ${s.stop}
-🎯 Targets ${s.targets[0]} → ${s.targets[1]} → ${s.targets[2]}
-⚖️ R:R    1 : ${s.rr}
-
-${note}
-
+  function hook(s, p) {
+    return `${s.ticker} – ${p.opener}
+${s.direction === "LONG" ? "Long" : "Short"} ${s.ticker}
+Entry: ${s.entryLow} – ${s.entryHigh}
+SL: ${s.stop}
+TP1: ${s.targets[0]}
+TP2: ${s.targets[1]}
+TP3: ${s.targets[2]}
+${p.closer}
+${p.cta}
 ${s.ticker}`;
-  },
-  function minimal(s, note) {
-    return `*${s.direction} ${s.ticker}*
-
-Entry ${s.entryLow} – ${s.entryHigh}
-Stop  ${s.stop}
-Targets ${s.targets[0]} / ${s.targets[1]} / ${s.targets[2]}
-R:R 1:${s.rr}
-
-${note}`;
   },
 ];
 
 export const TEMPLATE_NAMES = TEMPLATES.map((f) => f.name);
 
 export function render(s, index, seed) {
-  return TEMPLATES[index % TEMPLATES.length](s, noteFor(s, seed));
+  return TEMPLATES[index % TEMPLATES.length](s, parts(s, seed));
 }
-
 // ---------------------------------------------------------------- telegram
 
 async function sendMessage(token, chatId, text) {
@@ -533,10 +521,8 @@ async function sendMessage(token, chatId, text) {
       body: JSON.stringify(body),
     }).then((r) => r.json());
 
-  const base = { chat_id: chatId, text, disable_web_page_preview: true };
-  let res = await post({ ...base, parse_mode: "Markdown" });
-  if (!res.ok && /parse/i.test(res.description || "")) res = await post(base); // retry as plain text
-  return res;
+  // Templates are plain text, so no parse_mode: nothing to mis-parse on odd tickers.
+  return post({ chat_id: chatId, text, disable_web_page_preview: true });
 }
 
 // ---------------------------------------------------------------- main

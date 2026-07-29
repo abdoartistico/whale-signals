@@ -79,14 +79,64 @@ const decs = new Set([s.entryLow, s.entryHigh, s.stop, ...s.targets].map((x) => 
 eq("uniform precision", decs.size, 1);
 
 // --- rendering ---
-eq("template count", TEMPLATE_NAMES.length, 7);
+eq("template count", TEMPLATE_NAMES.length, 3);
+eq("template names", TEMPLATE_NAMES, ["setup", "compact", "hook"]);
+
 for (let i = 0; i < TEMPLATE_NAMES.length; i++) {
   const out = render(s, i, i);
-  if (!out.trim() || out.includes("undefined") || out.includes("NaN")) fails.push(`template ${TEMPLATE_NAMES[i]} bad:\n${out}`);
-  if ((out.match(/\*/g) || []).length % 2) fails.push(`template ${TEMPLATE_NAMES[i]} unbalanced bold`);
+  const name = TEMPLATE_NAMES[i];
+  if (!out.trim() || out.includes("undefined") || out.includes("NaN") || out.includes("{"))
+    fails.push(`template ${name} bad:\n${out}`);
+  // every layout must carry the full trade plan
+  for (const need of [s.entryLow, s.entryHigh, s.stop, ...s.targets, s.ticker])
+    if (!out.includes(need)) fails.push(`template ${name} is missing ${need}`);
+  if (!out.includes("👇")) fails.push(`template ${name} is missing the CTA`);
+  // plain text on purpose -- no Markdown markers to break on odd tickers
+  if (out.includes("*") || out.includes("_")) fails.push(`template ${name} leaked Markdown`);
 }
-eq("rotation wraps", render(s, 0, 1), render(s, 7, 1));
+
+eq("rotation wraps", render(s, 0, 1), render(s, 3, 1));
 eq("neighbours differ", render(s, 0, 1) === render(s, 1, 2), false);
+
+// --- wording actually rotates (the whole point) ---
+const seen = new Set();
+for (let seed = 0; seed < 60; seed++) seen.add(render(s, seed % 3, seed));
+eq("60 seeds produce many distinct messages", seen.size >= 50, true);
+
+const openers = new Set(), closers = new Set(), ctas = new Set();
+for (let seed = 0; seed < 60; seed++) {
+  const setupOut = render(s, 0, seed);
+  openers.add(setupOut.split("\n")[2]); // the 💎 line
+  ctas.add(setupOut.split("\n").find((l) => l.includes("👇")));
+  closers.add(render(s, 1, seed).split("\n")[6]); // compact's sentiment line
+}
+eq("openers rotate", openers.size >= 10, true);
+eq("closers rotate", closers.size >= 10, true);
+eq("CTAs rotate", ctas.size >= 4, true);
+
+// slots must not advance in lockstep, or the variety collapses
+const pairA = new Set();
+for (let seed = 0; seed < 40; seed++) {
+  const o = render(s, 0, seed).split("\n")[2];
+  const c = render(s, 1, seed).split("\n")[6];
+  pairA.add(o + "||" + c);
+}
+eq("opener/closer combinations are decorrelated", pairA.size >= 30, true);
+
+// --- thousands separators on large prices ---
+const BIG = AAVE.replace("├Price: 96.38→96.63 (0.3%)", "├Price: 1920.5→1910.4 (-0.5%)");
+const bs = buildSetup(parseMessage(BIG, 9), CFG);
+eq("comma in entry", bs.entryLow.includes(","), true);
+eq("comma formatting", bs.entryLow, "1,906.6");
+eq("no comma on small prices", s.entryLow.includes(","), false);
+
+// SHORT direction wording must not say "Long"
+const shortSig = parseMessage(AAVE.replace("✳️ Buying Volume", "🔴 Selling Volume"), 11);
+const shortSetup = buildSetup(shortSig, CFG);
+for (let i = 0; i < 3; i++) {
+  const out = render(shortSetup, i, i);
+  if (/\bLong\b|\bLONG\b/.test(out)) fails.push(`template ${TEMPLATE_NAMES[i]} says Long on a SHORT signal:\n${out}`);
+}
 
 // --- second source: cointrendz_pumpdetector ---
 const PUMP = `🚀 Pump - REZ/USDT [Binance]
@@ -123,15 +173,12 @@ eq("pump targets ascend", ps.targets.map(Number).every((v, i, a) => i === 0 || v
 // tiny price must keep meaningful precision, not collapse to 0.00
 eq("pump precision", ps.targets[0], "0.003078");
 
-// every template must render this source without leaking undefined/NaN
+// The pump source is dormant (not in SOURCES) but the parser is kept working, so the
+// templates must still render it cleanly if it is ever switched back on.
 for (let i = 0; i < TEMPLATE_NAMES.length; i++) {
   const out = render(ps, i, i);
-  if (out.includes("undefined") || out.includes("NaN") || out.includes("n/a"))
+  if (out.includes("undefined") || out.includes("NaN"))
     fails.push(`pump template ${TEMPLATE_NAMES[i]} leaked a missing field:\n${out}`);
-  if ((out.match(/\*/g) || []).length % 2) fails.push(`pump template ${TEMPLATE_NAMES[i]} unbalanced bold`);
-  // must not claim order-flow stats this source never publishes
-  if (/dominance|Net volume/i.test(out))
-    fails.push(`pump template ${TEMPLATE_NAMES[i]} claims order-flow data that does not exist:\n${out}`);
 }
 
 // --- regression: the pump channel emits "$" as the numeric entity &#036;.

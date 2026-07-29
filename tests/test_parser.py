@@ -128,16 +128,48 @@ decs = {len(x.split(".")[1]) for x in [s.entry_low, s.entry_high, s.stop] + s.ta
 eq("uniform precision", len(decs), 1)
 
 # --- rendering ---
+eq("template count", len(TEMPLATES), 3)
+eq("template names", TEMPLATE_NAMES, ["setup", "compact", "hook"])
+
 for i, name in enumerate(TEMPLATE_NAMES):
     out = render(s, i, seed=i)
     if not out.strip() or "{" in out or "None" in out:
         fails.append(f"template {name} rendered badly:\n{out}")
-    if out.count("*") % 2:
-        fails.append(f"template {name} has unbalanced Markdown bold")
+    for need in [s.entry_low, s.entry_high, s.stop, *s.targets, s.ticker]:
+        if need not in out:
+            fails.append(f"template {name} is missing {need}")
+    if "👇" not in out:
+        fails.append(f"template {name} is missing the CTA")
+    if "*" in out or "_" in out:
+        fails.append(f"template {name} leaked Markdown")
 
-eq("template count", len(TEMPLATES), 7)
-eq("rotation wraps", render(s, 0, seed=1), render(s, len(TEMPLATES), seed=1))
+eq("rotation wraps", render(s, 0, seed=1), render(s, 3, seed=1))
 eq("neighbouring alerts differ", render(s, 0, seed=1) == render(s, 1, seed=2), False)
+
+# wording must actually rotate -- a linear stride would repeat every pool length
+distinct = {render(s, seed % 3, seed=seed) for seed in range(500)}
+eq("500 signals stay varied", len(distinct) >= 350, True)
+
+openers = {render(s, 0, seed=n).split("\n")[2] for n in range(60)}
+closers = {render(s, 1, seed=n).split("\n")[6] for n in range(60)}
+eq("openers rotate", len(openers) >= 10, True)
+eq("closers rotate", len(closers) >= 10, True)
+eq("slots decorrelated", len({(render(s, 0, seed=n).split(chr(10))[2],
+                              render(s, 1, seed=n).split(chr(10))[6]) for n in range(40)}) >= 30, True)
+
+# SHORT must never say Long
+short_sig = parse_message(AAVE.replace("✳️ Buying Volume", "🔴 Selling Volume"), 11)
+short_setup = build_setup(short_sig, CFG)
+for i, name in enumerate(TEMPLATE_NAMES):
+    out = render(short_setup, i, seed=i)
+    if "Long" in out or "LONG" in out:
+        fails.append(f"template {name} says Long on a SHORT signal:\n{out}")
+
+# --- thousands separators ---
+big = parse_message(AAVE.replace("├Price: 96.38→96.63 (0.3%)", "├Price: 1920.5→1910.4 (-0.5%)"), 9)
+bs = build_setup(big, CFG)
+eq("comma formatting", bs.entry_low, "1,906.6")
+eq("no comma on small prices", "," in s.entry_low, False)
 
 # --- second source: cointrendz_pumpdetector ---
 PUMP = """🚀 Pump - REZ/USDT [Binance]

@@ -220,10 +220,9 @@ def parse_pump_detector(text, msg_id=0):
 
 
 PARSERS = {"whaletracker": parse_message, "pumpdetector": parse_pump_detector}
-SOURCES = [
-    {"key": "whaletracker", "channel": "WhaleTracker"},
-    {"key": "pumpdetector", "channel": "cointrendz_pumpdetector"},
-]
+# Only WhaleTracker is active. parse_pump_detector above is kept and tested but dormant --
+# re-enable by adding {"key": "pumpdetector", "channel": "cointrendz_pumpdetector"} here.
+SOURCES = [{"key": "whaletracker", "channel": "WhaleTracker"}]
 
 
 # --- channel scraping ----------------------------------------------------------

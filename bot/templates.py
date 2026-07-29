@@ -1,274 +1,226 @@
 """Message templates.
 
-Seven layouts are rotated so consecutive posts never look alike, and the
-commentary line is picked from a data-driven pool seeded by the message id
-(deterministic -- the same alert always renders identically, but neighbouring
-alerts read differently).
+Three layouts. Each pulls its wording from rotating pools so consecutive posts never
+read the same: an opener/hook, a closing sentiment line, a call to action, and (for the
+SETUP layout) a follow line.
 
-All templates use Telegram's legacy *Markdown* parse mode.
+3 layouts x 24 openers x 24 closers x 6 CTAs x 4 follow lines -- roughly 400 distinct
+messages per 500 signals in practice. Selection is seeded off the message id, so it is
+deterministic but decorrelated per slot.
+
+Plain text on purpose: no Markdown markers, so nothing can mis-parse on odd tickers.
 """
 
+LONG_OPENERS = [
+    "Strong buying pressure is increasing.",
+    "Momentum is building above support.",
+    "Buyers are stepping in with size.",
+    "Demand is picking up fast.",
+    "Accumulation is showing on the tape.",
+    "Buying volume is expanding.",
+    "Bulls are taking control here.",
+    "Support is holding firm.",
+    "Order flow has flipped bullish.",
+    "Buyers are defending this zone.",
+    "Upside pressure is building.",
+    "A breakout attempt is developing.",
+    "Volume is confirming the move up.",
+    "Dips are being bought aggressively.",
+    "Strength is returning after the pullback.",
+    "Bullish momentum is accelerating.",
+    "Buyers are absorbing the offers.",
+    "Interest is rotating into this pair.",
+    "The trend is turning up.",
+    "Fresh demand is entering the market.",
+    "Price is coiling for a move higher.",
+    "Sellers are running out of steam.",
+    "Higher lows are forming.",
+    "Continuation looks likely from here.",
+]
 
-def money(v, quote="USDT"):
-    unit = "$" if quote in ("USDT", "USDC", "USD", "FDUSD", "TUSD") else ""
-    suffix = "" if unit else f" {quote}"
-    for div, tag in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
-        if abs(v) >= div:
-            return f"{unit}{v / div:.2f}{tag}{suffix}"
-    if abs(v) < 100:                       # BTC/ETH-quoted pairs need decimals
-        return f"{unit}{v:.4g}{suffix}"
-    return f"{unit}{v:,.0f}{suffix}"
+SHORT_OPENERS = [
+    "Strong selling pressure is increasing.",
+    "Momentum is breaking down below resistance.",
+    "Sellers are stepping in with size.",
+    "Supply is picking up fast.",
+    "Distribution is showing on the tape.",
+    "Selling volume is expanding.",
+    "Bears are taking control here.",
+    "Resistance is capping every bounce.",
+    "Order flow has flipped bearish.",
+    "Sellers are defending this zone.",
+    "Downside pressure is building.",
+    "A breakdown is developing.",
+    "Volume is confirming the move down.",
+    "Rallies are being sold aggressively.",
+    "Weakness is returning after the bounce.",
+    "Bearish momentum is accelerating.",
+    "Sellers are hitting the bids.",
+    "Money is rotating out of this pair.",
+    "The trend is turning down.",
+    "Fresh supply is entering the market.",
+    "Price is rolling over.",
+    "Buyers are running out of steam.",
+    "Lower highs are forming.",
+    "Continuation lower looks likely from here.",
+]
+
+LONG_CLOSERS = [
+    "Buying interest remains strong, keeping the bullish trend intact as long as support holds. 📈",
+    "Buyers are defending key levels and momentum stays positive while this zone holds.",
+    "Price is showing strength after the recent dip, with buyers active on every pullback.",
+    "As long as the entry zone holds, continuation toward the targets stays on the table. 📈",
+    "Demand is outpacing supply here, and the structure stays bullish above the stop.",
+    "Momentum favours the upside while price holds above support. 🚀",
+    "Accumulation continues and dips keep getting absorbed by buyers.",
+    "The bullish structure remains valid unless the stop level gives way.",
+    "Buyers are in control and the path of least resistance points higher. 📈",
+    "Strength is building steadily, and a push toward the targets looks reasonable.",
+    "Support has held cleanly, which keeps the upside scenario alive.",
+    "Volume is backing the move, suggesting real interest rather than a fake push.",
+    "The setup stays valid while price consolidates above the entry zone.",
+    "Buyers keep defending, and a continuation move is possible if this level holds. 📈",
+    "Pressure is on the upside, with sellers struggling to push price lower.",
+    "Trend and momentum are aligned to the upside for now. 🚀",
+    "Interest is picking up and the reaction off support has been strong.",
+    "This zone has attracted consistent buying, keeping the bias bullish.",
+    "A hold above the entry zone keeps the targets in play.",
+    "Bulls remain in charge while the stop level stays untouched. 📈",
+    "The pullback looks corrective, with the larger move still pointing up.",
+    "Buyers are absorbing supply, which often precedes an expansion higher.",
+    "Momentum remains constructive as long as the structure holds.",
+    "Risk stays defined at the stop while the upside targets remain open. 📈",
+]
+
+SHORT_CLOSERS = [
+    "Selling interest remains strong, keeping the bearish trend intact as long as resistance holds. 📉",
+    "Sellers are defending key levels and momentum stays negative while this zone caps price.",
+    "Price is showing weakness after the recent bounce, with sellers active on every rally.",
+    "As long as price stays under the entry zone, continuation toward the targets stays on the table. 📉",
+    "Supply is outpacing demand here, and the structure stays bearish below the stop.",
+    "Momentum favours the downside while price holds below resistance. 🔻",
+    "Distribution continues and rallies keep getting sold.",
+    "The bearish structure remains valid unless the stop level is reclaimed.",
+    "Sellers are in control and the path of least resistance points lower. 📉",
+    "Weakness is building steadily, and a push toward the targets looks reasonable.",
+    "Resistance has held cleanly, which keeps the downside scenario alive.",
+    "Volume is backing the move, suggesting real selling rather than a shakeout.",
+    "The setup stays valid while price consolidates below the entry zone.",
+    "Sellers keep pressing, and a continuation move is possible if this level caps price. 📉",
+    "Pressure is on the downside, with buyers struggling to lift price.",
+    "Trend and momentum are aligned to the downside for now. 🔻",
+    "Selling is picking up and the rejection from resistance has been clean.",
+    "This zone has attracted consistent selling, keeping the bias bearish.",
+    "Staying below the entry zone keeps the targets in play.",
+    "Bears remain in charge while the stop level holds. 📉",
+    "The bounce looks corrective, with the larger move still pointing down.",
+    "Sellers are absorbing bids, which often precedes an expansion lower.",
+    "Momentum remains weak as long as the structure holds.",
+    "Risk stays defined at the stop while the downside targets remain open. 📉",
+]
+
+CTAS = [
+    "Open your trade 👇",
+    "Trade from here 👇",
+    "Trade here 👇",
+    "Enter from here 👇",
+    "Take the setup here 👇",
+    "Start your trade 👇",
+]
+
+FOLLOW_LINES = [
+    "✅ Follow for more high-quality trade setups.",
+    "✅ Follow for more setups like this.",
+    "✅ More high-quality setups posted daily.",
+    "✅ Stay tuned for more premium setups.",
+]
 
 
-def _net(sig, tf):
-    return sig.net_vol.get(tf)
+def _hash32(x):
+    """Mirror of the Worker's hash32 so both implementations pick identically."""
+    x &= 0xFFFFFFFF
+    x = (x ^ 61) ^ (x >> 16)
+    x = (x + (x << 3)) & 0xFFFFFFFF
+    x ^= x >> 4
+    x = (x * 0x27D4EB2D) & 0xFFFFFFFF
+    x ^= x >> 15
+    return x & 0xFFFFFFFF
 
 
-def _signed(v, d=2):
-    return f"{'+' if v > 0 else ''}{v:.{d}f}%"
+def _pick(pool, seed, salt):
+    """Independent draw per slot.
 
-
-def _facts(s):
-    """Human-readable fragments built from the actual alert data.
-
-    The two sources publish different things, so `stat_line` and `bullets` are
-    built per-source; templates use those rather than raw fields, which keeps all
-    seven layouts working for both without claiming data that does not exist.
+    A linear stride (seed * salt) looks varied but makes the slots move in lockstep, so
+    the whole message repeats with a period equal to the pool size. Hashing avoids that.
     """
-    sig = s.signal
-    side_word = "Buy" if sig.side == "buy" else "Sell"
-    f = _base_facts(s, sig, side_word)
-
-    if sig.source == "pumpdetector":
-        vol_ch = "" if sig.vol_change_pct is None else f" ({_signed(sig.vol_change_pct, 0)})"
-        f["stat_line"] = (
-            f"📈 Move {f['move']}  ·  Vol {f['vol24']}{vol_ch}"
-            + (f"  ·  {sig.exchange}" if sig.exchange else "")
-        )
-        f["bullets"] = [
-            f"Price jumped {f['move']} from ${sig.price_from_raw} to ${sig.price_raw}",
-            f"Volume at {f['vol24']}" if sig.vol_change_pct is None
-            else f"Volume up {_signed(sig.vol_change_pct, 0)} to {f['vol24']}",
-            f"{money(sig.vol_increase, sig.quote)} of fresh volume"
-            + (f" on {sig.exchange}" if sig.exchange else ""),
-        ]
-    else:
-        f["stat_line"] = f"📈 24h {f['ch24']:+.2f}%  ·  4h {f['ch4']:+.2f}%  ·  Vol {f['vol24']}"
-        pct = lambda v: "n/a" if v is None else f"{v:+.0f}%"  # noqa: E731
-        f["bullets"] = [
-            f"{f['dom']} {side_word.lower()}-side dominance on {f['vol']} in {f['window']}",
-            f"Net volume 15m {pct(f['n15'])} · 1h {pct(f['n1h'])}",
-            f"{f['vol24']} traded in 24h · {f['alerts24_txt']} today",
-        ]
-    return f
+    mixed = ((seed * 0x9E3779B1) & 0xFFFFFFFF) + ((salt * 0x85EBCA6B) & 0xFFFFFFFF)
+    return pool[_hash32(mixed) % len(pool)]
 
 
-def _base_facts(s, sig, side_word):
+def parts_for(s, seed):
+    long = s.direction == "LONG"
     return {
-        "dom": f"{sig.dominance:.0f}%",
-        "side_word": side_word,
-        "vol": money(sig.alert_volume, sig.quote),
-        "window": sig.window,
-        "vol24": money(sig.vol24h, sig.quote),
-        "ch24": sig.change.get("24h", 0.0),
-        "ch4": sig.change.get("4h", 0.0),
-        "ch1": sig.change.get("1h", 0.0),
-        "n15": _net(sig, "15m"),
-        "n1h": _net(sig, "1h"),
-        "n4h": _net(sig, "4h"),
-        "alerts4": sig.alerts_4h,
-        "alerts24": sig.alerts_24h,
-        "move": _signed(sig.price_move_pct or 0.0),
-        "alerts4_txt": _plural(sig.alerts_4h, f"{side_word.lower()} alert"),
-        "alerts24_txt": _plural(sig.alerts_24h, "alert"),
+        "opener": _pick(LONG_OPENERS if long else SHORT_OPENERS, seed, 1),
+        "closer": _pick(LONG_CLOSERS if long else SHORT_CLOSERS, seed, 7),
+        "cta": _pick(CTAS, seed, 13),
+        "follow": _pick(FOLLOW_LINES, seed, 5),
     }
 
 
-def _plural(n, word):
-    return f"{n} {word}" if n == 1 else f"{n} {word}s"
-
-
-LONG_NOTES = [
-    "{side_word} orders took {dom} of a {vol} sweep in {window}. Net volume is holding positive, and buyers keep stepping in above support.",
-    "A {vol} buy-side sweep hit in {window} with {dom} of it on the bid. Momentum is building while the {ch24:+.2f}% daily trend stays intact.",
-    "Buyers absorbed the offer with {dom} dominance on {vol} traded in {window}. As long as the entry zone holds, continuation stays on the table.",
-    "Aggressive accumulation: {dom} of {vol} in {window} came from the buy side. Net volume turned positive on the 15m and 1h.",
-    "Demand is showing up — {vol} in {window}, {dom} of it buying. Price is defending the level and the higher-timeframe trend is still up.",
-    "Repeat interest — {alerts4_txt} on this pair in the last 4h, the latest {vol} at {dom} dominance. Clustered demand often precedes expansion.",
-    "Order flow flipped bullish: {dom} buy-side on {vol} in {window}, against {vol24} of daily turnover. Watching for follow-through.",
-    "Strength after the pullback. Buyers defended the zone with {vol} of demand in {window} and net volume stayed green.",
-]
-
-SHORT_NOTES = [
-    "{side_word} orders took {dom} of a {vol} dump in {window}. Sellers are in control while price stays under the entry zone.",
-    "A {vol} sell-side sweep hit in {window}, {dom} of it offered. Supply is heavy and the bounce is being sold.",
-    "Distribution showing: {dom} of {vol} in {window} came from sellers. Net volume is negative and rallies keep failing.",
-    "Sellers pressed {vol} through the book in {window} with {dom} dominance. Momentum stays down unless the stop level reclaims.",
-    "Heavy offer into strength — {vol} in {window}, {dom} selling, against {vol24} of daily volume. Continuation lower is favoured.",
-    "Persistent supply — {alerts4_txt} on this pair in the last 4h, the latest {vol} at {dom} dominance. It rarely clears in one move.",
-    "Bearish order flow: {dom} sell-side on {vol} in {window}. Price is losing the level and buyers are not defending it.",
-    "Rejection from the zone. {vol} of supply in {window} with {dom} on the ask, and net volume rolled over.",
-]
-
-
-# The pump channel publishes no order-flow data, so it gets commentary that only
-# claims what its messages actually contain.
-PUMP_NOTES = [
-    "Price jumped {move} on {vol24} of volume. Momentum is live — the move is already underway, so the entry zone matters more than usual.",
-    "Sharp expansion: {move} with volume at {vol24}. Buyers are paying up, and continuation depends on this level holding.",
-    "Volume-driven breakout, {move} with fresh participation stepping in. Watch for a hold above the entry zone rather than chasing the wick.",
-    "A {move} impulse backed by real turnover. Strong moves often extend, but late entries carry the most risk — respect the stop.",
-    "Buyers took control fast: {move} on {vol24}. If price consolidates above the zone instead of fading, continuation is on the table.",
-    "Fresh volume is driving this {move} move. Interest is clearly picking up, though the first leg has already played out.",
-    "Breakout in progress — {move} with volume confirming. The zone below is where the move either holds or fails.",
-    "Momentum ignition: {move}, volume expanding. Treat the entry zone as the line in the sand for this setup.",
-]
-
-DUMP_NOTES = [
-    "Price broke down {move} on {vol24} of volume. Sellers are in control and bounces are being absorbed.",
-    "Sharp flush: {move} with volume at {vol24}. Supply is heavy and the level below is now resistance.",
-    "Volume-driven breakdown, {move}. Momentum is lower while price stays beneath the entry zone.",
-    "A {move} impulse to the downside backed by real turnover. Late shorts carry the most risk — respect the stop.",
-]
-
-
-def note_for(s, seed):
-    if s.signal.source == "pumpdetector":
-        pool = PUMP_NOTES if s.direction == "LONG" else DUMP_NOTES
-    else:
-        pool = LONG_NOTES if s.direction == "LONG" else SHORT_NOTES
-    return pool[seed % len(pool)].format(**_facts(s))
-
-
 # --- templates ----------------------------------------------------------------
-# Each takes (setup, note) and returns the finished message string.
+# Each takes (setup, parts) and returns the finished message.
 
-def t_boxed(s, note):
+def t_setup(s, p):
     return (
-        f"◆ *{s.ticker}* ({s.direction}) {s.emoji}\n"
-        f"───────────────────\n"
-        f"📍 *Entry Zone* : {s.entry_low} – {s.entry_high}\n"
-        f"🛡️ *Stop Loss*  : {s.stop}\n\n"
-        f"🎯 *Take Profit Targets:*\n"
-        f"✦ *TP1* : {s.targets[0]}\n"
-        f"✦ *TP2* : {s.targets[1]}\n"
-        f"✦ *TP3* : {s.targets[2]}\n\n"
-        f"💡 {note}\n"
-        f"───────────────────\n"
-        f"*{s.ticker}*"
-    )
-
-
-def t_plain(s, note):
-    verb = "Breaking above" if s.direction == "LONG" else "Losing"
-    tail = "could unlock further upside" if s.direction == "LONG" else "opens the door to further downside"
-    word = "Long" if s.direction == "LONG" else "Short"
-    return (
-        f"{s.ticker} — {verb} {s.targets[0]} {tail}.\n\n"
-        f"{word} {s.ticker}\n\n"
-        f"Entry: {s.entry_low}–{s.entry_high}\n"
-        f"SL: {s.stop}\n\n"
-        f"TP1: {s.targets[0]}\n"
-        f"TP2: {s.targets[1]}\n"
-        f"TP3: {s.targets[2]}\n\n"
-        f"{note}\n\n"
-        f"Trade here 👇\n\n"
-        f"{s.ticker}"
-    )
-
-
-def t_rocket(s, note):
-    lead = "🚀" if s.direction == "LONG" else "⚡"
-    return (
-        f"{lead} *{s.ticker} {s.direction} SETUP* {s.arrow}🔥\n\n"
-        f"Entry: {s.entry_low}–{s.entry_high}\n\n"
-        f"🎯 *Take Profit Targets*\n"
-        f"1️⃣ TP1: {s.targets[0]}\n"
-        f"2️⃣ TP2: {s.targets[1]}\n"
-        f"3️⃣ TP3: {s.targets[2]}\n\n"
-        f"🛡️ SL: {s.stop}\n\n"
-        f"━━━━━━━━━━━━━━\n\n"
-        f"📊 {note}\n\n"
-        f"Trade here 👇\n\n"
-        f"{s.ticker}"
-    )
-
-
-def t_headline(s, note):
-    hook = (
-        "Buyers are defending support, more upside possible"
-        if s.direction == "LONG"
-        else "Sellers are capping every bounce, more downside possible"
-    )
-    word = "Long" if s.direction == "LONG" else "Short"
-    return (
-        f"🚀 *{s.ticker} — {hook}* {s.arrow}🔥\n\n"
-        f"{word} {s.ticker} {s.emoji}\n\n"
-        f"Entry: {s.entry_low}–{s.entry_high}\n\n"
+        f"🔥 {s.direction} SETUP — {s.ticker}\n\n"
+        f"💎 {p['opener']}\n\n"
+        f"Entry Zone: {s.entry_low} – {s.entry_high}\n\n"
+        f"🛡️ Stop Loss: {s.stop}\n\n"
         f"🎯 Take Profit:\n"
+        f" TP1: {s.targets[0]}\n"
+        f" TP2: {s.targets[1]}\n"
+        f" TP3: {s.targets[2]}\n\n"
+        f"{p['follow']}\n\n"
+        f"{p['cta']}\n\n"
+        f"{s.ticker}"
+    )
+
+
+def t_compact(s, p):
+    return (
+        f"{s.ticker} — {s.direction} {s.emoji}\n"
+        f"Entry: {s.entry_low} – {s.entry_high}\n"
+        f"SL: {s.stop}\n"
         f"TP1: {s.targets[0]}\n"
         f"TP2: {s.targets[1]}\n"
-        f"TP3: {s.targets[2]}\n\n"
-        f"🛡️ SL: {s.stop}\n\n"
-        f"{note}\n\n"
-        f"Trade here 👇\n\n"
+        f"TP3: {s.targets[2]}\n"
+        f"{p['closer']}\n"
+        f"{p['cta']}\n"
         f"{s.ticker}"
     )
 
 
-def t_card(s, note):
-    f = _facts(s)
+def t_hook(s, p):
+    word = "Long" if s.direction == "LONG" else "Short"
     return (
-        f"╭━━━ *TRADE IDEA* ━━━╮\n"
-        f"  {s.ticker}   ·   *{s.direction}* {s.emoji}\n"
-        f"╰━━━━━━━━━━━━━━━╯\n\n"
-        f"`Entry `  {s.entry_low} – {s.entry_high}\n"
-        f"`Stop  `  {s.stop}\n"
-        f"`TP1   `  {s.targets[0]}\n"
-        f"`TP2   `  {s.targets[1]}\n"
-        f"`TP3   `  {s.targets[2]}\n"
-        f"`R:R   `  1 : {s.rr}\n\n"
-        f"{f['stat_line']}\n\n"
-        f"{note}\n\n"
-        f"*{s.ticker}*"
-    )
-
-
-def t_checklist(s, note):
-    f = _facts(s)
-    bullets = "\n".join(f"✅ {b}" for b in f["bullets"])
-    return (
-        f"{s.emoji} *{s.ticker} · {s.direction}*\n\n"
-        f"*Why this setup:*\n"
-        f"{bullets}\n\n"
-        f"*The plan:*\n"
-        f"📍 Entry  {s.entry_low} – {s.entry_high}\n"
-        f"🛡️ Stop   {s.stop}\n"
-        f"🎯 Targets {s.targets[0]} → {s.targets[1]} → {s.targets[2]}\n"
-        f"⚖️ R:R    1 : {s.rr}\n\n"
-        f"{note}\n\n"
+        f"{s.ticker} – {p['opener']}\n"
+        f"{word} {s.ticker}\n"
+        f"Entry: {s.entry_low} – {s.entry_high}\n"
+        f"SL: {s.stop}\n"
+        f"TP1: {s.targets[0]}\n"
+        f"TP2: {s.targets[1]}\n"
+        f"TP3: {s.targets[2]}\n"
+        f"{p['closer']}\n"
+        f"{p['cta']}\n"
         f"{s.ticker}"
     )
 
 
-def t_minimal(s, note):
-    word = "LONG" if s.direction == "LONG" else "SHORT"
-    return (
-        f"*{word} {s.ticker}*\n\n"
-        f"Entry {s.entry_low} – {s.entry_high}\n"
-        f"Stop  {s.stop}\n"
-        f"Targets {s.targets[0]} / {s.targets[1]} / {s.targets[2]}\n"
-        f"R:R 1:{s.rr}\n\n"
-        f"{note}"
-    )
-
-
-TEMPLATES = [t_boxed, t_plain, t_rocket, t_headline, t_card, t_checklist, t_minimal]
+TEMPLATES = [t_setup, t_compact, t_hook]
 TEMPLATE_NAMES = [f.__name__[2:] for f in TEMPLATES]
 
 
 def render(s, index, seed=None):
-    """Render setup `s` with template #index (rotating) and a varied commentary line."""
-    tpl = TEMPLATES[index % len(TEMPLATES)]
+    """Render setup `s` with template #index (rotating) and seeded wording."""
     seed = seed if seed is not None else s.signal.msg_id
-    return tpl(s, note_for(s, seed))
+    return TEMPLATES[index % len(TEMPLATES)](s, parts_for(s, seed))

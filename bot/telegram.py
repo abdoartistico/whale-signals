@@ -26,18 +26,12 @@ def call(token, method, payload, timeout=30):
 
 
 def send_message(token, chat_id, text, disable_preview=True):
-    """Send with Markdown; fall back to plain text if Telegram rejects the entities."""
-    payload = {
+    """Send as plain text -- templates carry no Markdown, so nothing can mis-parse."""
+    return call(token, "sendMessage", {
         "chat_id": chat_id,
         "text": text,
-        "parse_mode": "Markdown",
         "disable_web_page_preview": disable_preview,
-    }
-    res = call(token, "sendMessage", payload)
-    if not res.get("ok") and "parse" in str(res.get("description", "")).lower():
-        payload.pop("parse_mode")
-        res = call(token, "sendMessage", payload)
-    return res
+    })
 
 
 def get_me(token):

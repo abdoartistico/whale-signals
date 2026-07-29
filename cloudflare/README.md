@@ -6,18 +6,13 @@ like it".
 
 ## Sources
 
-Both channels are polled every tick, each with independent state in KV, so one going quiet
-or failing never blocks the other:
+Only [@WhaleTracker](https://t.me/WhaleTracker) is active (~24 alerts/hour).
 
-| Key | Channel | Notes |
-|---|---|---|
-| `whaletracker` | [@WhaleTracker](https://t.me/WhaleTracker) | order-flow alerts, ~24/hour |
-| `pumpdetector` | [@cointrendz_pumpdetector](https://t.me/cointrendz_pumpdetector) | pump alerts, ~1/hour, Binance only |
-
-Add another by appending to `SOURCES` in `src/worker.js` and registering a parser in
-`PARSERS`. Each source needs its own parser and commentary pool — the templates render
-whatever `statLine`/`bullets` the source's `facts()` branch produces, so a new source never
-inherits claims about data it doesn't publish.
+`parsePumpDetector` for [@cointrendz_pumpdetector](https://t.me/cointrendz_pumpdetector) is
+kept and still covered by tests, but **dormant** — add
+`{ key: "pumpdetector", channel: "cointrendz_pumpdetector" }` to `SOURCES` to switch it
+back on. Each source keeps independent state in KV, so one going quiet or failing never
+blocks another.
 
 **Gotcha worth knowing:** the pump channel encodes `$` as the numeric HTML entity `&#036;`.
 `stripHtml` decodes numeric and hex entities for this reason; decoding only named entities

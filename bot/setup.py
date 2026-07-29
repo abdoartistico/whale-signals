@@ -21,7 +21,8 @@ def precision_for(price, ref_raw):
 
 
 def fmt_price(value, dec):
-    return f"{value:.{dec}f}"
+    """Fixed decimals plus thousands separators, e.g. 1905.5 -> '1,905.5'."""
+    return f"{value:,.{dec}f}"
 
 
 @dataclass
