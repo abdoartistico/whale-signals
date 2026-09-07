@@ -27,10 +27,8 @@ const CONFIG = {
   // Binance Square limits: 100 posts/day. Stay under it with margin.
   maxPostsPerDay: 95,
   minMinutesBetweenPosts: 15, // 15 min => at most 96/day, so the cap cannot be hit
-  postToBinanceSquare: true,
-  // Telegram is no longer a destination -- it receives a confirmation with the
-  // Binance post link after each successful publish, so you can verify it landed.
-  telegramConfirm: true,
+  // Publishing goes through the GitHub Action (see publishing section for why).
+  // Telegram receives a confirmation with the Binance post link from that Action.
 };
 
 const SOURCES = [{ key: "whaletracker", channel: "WhaleTracker" }];
@@ -486,73 +484,49 @@ Trade here 👇
 ${s.ticker}`;
 }
 // ---------------------------------------------------------------- publishing
+//
+// Binance blocks Cloudflare Workers' egress IPs: this Worker gets a plain nginx 403
+// from /content/add while a GitHub Actions runner and a home connection both get 200.
+// Workers cannot choose their egress IP, so the publish hop is delegated to a GitHub
+// Action, which Cloudflare CAN reach. Everything else -- scheduling, parsing, the coin
+// filter, rate limiting and state -- stays here.
 
-const SQUARE_URL = "https://www.binance.com/bapi/composite/v1/public/pgc/openApi/content/add";
+const WORKFLOW_FILE = "publish-square.yml";
 
 /**
- * Publish a short text post to Binance Square.
- * Schema and semantics mirror Binance's own square-post client:
- *   POST /content/add  { contentType: 1, bodyTextOnly }
- *   success when code === "000000"; a 504 on this endpoint means the post landed
- *   but the id could not be returned, so it must NOT be retried.
+ * Trigger the GitHub workflow that publishes to Binance Square.
+ * Returns 204 with no body on success.
  */
-export async function postToSquare(apiKey, text) {
+export async function dispatchPublish(env, text, meta) {
+  const repo = env.GITHUB_REPO || "abdoartistico/whale-signals";
+  const token = env.GITHUB_TOKEN || "";
+  if (!token) return { ok: false, error: "GITHUB_TOKEN is not set" };
+
   let res;
   try {
-    res = await fetch(SQUARE_URL, {
+    res = await fetch(`https://api.github.com/repos/${repo}/actions/workflows/${WORKFLOW_FILE}/dispatches`, {
       method: "POST",
       headers: {
-        "X-Square-OpenAPI-Key": apiKey,
+        Authorization: `Bearer ${token}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "whale-signals-worker", // GitHub rejects requests without one
         "Content-Type": "application/json",
-        clienttype: "binanceSkill",
       },
-      body: JSON.stringify({ contentType: 1, bodyTextOnly: text }),
+      body: JSON.stringify({
+        ref: env.GITHUB_REF || "main",
+        inputs: { text, meta: JSON.stringify(meta) },
+      }),
     });
   } catch (err) {
     return { ok: false, error: `network: ${err}` };
   }
 
-  // Documented by Binance: treat as published, do not retry or it double-posts.
-  if (res.status === 504) return { ok: true, id: null, note: "success_without_post_id" };
-
-  const raw = await res.text();
-  let json;
-  try {
-    json = JSON.parse(raw);
-  } catch {
-    return { ok: false, error: `non-JSON ${res.status}: ${raw.slice(0, 160)}` };
-  }
-  if (json.code !== "000000") return { ok: false, error: `[${json.code}] ${json.message}`, code: json.code };
-  return { ok: true, id: json.data?.id ?? null, link: json.data?.shareLink ?? null };
+  if (res.status === 204) return { ok: true };
+  const body = await res.text();
+  return { ok: false, error: `github ${res.status}: ${body.slice(0, 200)}` };
 }
 
-/** Telegram is used only to confirm a Square post landed, with its link. */
-export function confirmationText(s, result, quota) {
-  const link = result.link
-    ? result.link
-    : result.note === "success_without_post_id"
-      ? "(published, but Binance returned no link for this one)"
-      : "(link unavailable)";
-  return `✅ Posted to Binance Square
-
-${s.ticker} — ${s.direction}
-Entry: ${s.entryLow} - ${s.entryHigh}
-SL: ${s.stop}
-TP: ${s.targets.join(" / ")}
-
-${link}
-
-Post ${quota.used}/${quota.cap} today`;
-}
-
-async function sendTelegram(token, chatId, text) {
-  const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true }),
-  });
-  return res.json();
-}
 // ---------------------------------------------------------------- main
 
 const utcDay = (ms) => new Date(ms).toISOString().slice(0, 10);
@@ -568,13 +542,8 @@ function rollQuota(state, nowMs) {
 }
 
 async function runOnce(env, { dryRun = false, force = false } = {}) {
-  const squareKey = env.BINANCE_SQUARE_KEY || "";
-  const tgToken = env.TELEGRAM_BOT_TOKEN || "";
-  const tgChats = (env.TELEGRAM_CHAT_ID || "").split(",").map((c) => c.trim()).filter(Boolean);
 
-  if (CONFIG.postToBinanceSquare && !squareKey && !dryRun) {
-    return { error: "BINANCE_SQUARE_KEY is not set" };
-  }
+  if (!env.GITHUB_TOKEN && !dryRun) return { error: "GITHUB_TOKEN is not set" };
 
   const nowMs = Date.now();
   const stored = await env.STATE.get("state", { type: "json" });
@@ -640,29 +609,27 @@ async function runOnce(env, { dryRun = false, force = false } = {}) {
       if (dryRun) {
         log.push(`[dry] ${sig.symbol} ${s.direction} (${eligible.length} eligible, posting newest)\n${text}`);
       } else {
-        const r = await postToSquare(squareKey, text);
+        const meta = {
+          ticker: s.ticker,
+          direction: s.direction,
+          entry: `${s.entryLow} - ${s.entryHigh}`,
+          sl: s.stop,
+          tps: s.targets.join(" / "),
+          used: state.quota.count + 1,
+          cap: CONFIG.maxPostsPerDay,
+        };
+        const r = await dispatchPublish(env, text, meta);
         if (!r.ok) {
-          log.push(`square: FAILED ${sig.symbol}: ${r.error}`);
+          log.push(`dispatch FAILED ${sig.symbol}: ${r.error}`);
         } else {
-          log.push(`square: posted ${sig.symbol} ${s.direction}${r.link ? ` ${r.link}` : ""}${r.note ? ` (${r.note})` : ""}`);
+          // Dispatch accepted. The Action performs the Binance post and sends the
+          // Telegram confirmation with the link. Counting here (rather than on the
+          // Action's result) can only ever under-post, never breach the daily cap.
+          log.push(`dispatched ${sig.symbol} ${s.direction} to GitHub for publishing`);
           state.quota.count += 1;
           state.quota.lastPostMs = nowMs;
           state.sentTotal = (state.sentTotal || 0) + 1;
           posted += 1;
-
-          // Confirm to Telegram with the link. A failure here must NOT affect the
-          // post -- it is already live on Square and must never be republished.
-          if (CONFIG.telegramConfirm && tgToken) {
-            const note = confirmationText(s, r, { used: state.quota.count, cap: CONFIG.maxPostsPerDay });
-            for (const cid of tgChats) {
-              try {
-                const tr = await sendTelegram(tgToken, cid, note);
-                if (!tr.ok) log.push(`telegram confirm failed ${cid}: ${tr.description}`);
-              } catch (err) {
-                log.push(`telegram confirm threw ${cid}: ${err}`);
-              }
-            }
-          }
         }
       }
     }

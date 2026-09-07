@@ -1,0 +1,113 @@
+name: Publish to Binance Square
+
+# Triggered by the Cloudflare Worker, never on a schedule.
+#
+# Why this exists: Binance blocks Cloudflare Workers' egress IPs (verified: the Worker
+# gets a plain nginx 403 while a GitHub runner gets 200). Cloudflare keeps the reliable
+# 2-minute cron and owns all the state, filtering and rate limiting; this workflow is
+# only the outbound hop that Binance actually accepts.
+
+on:
+  workflow_dispatch:
+    inputs:
+      text:
+        description: "The exact post body to publish"
+        required: true
+        type: string
+      meta:
+        description: "JSON: ticker, direction, entry, sl, tps, used, cap"
+        required: false
+        default: "{}"
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: publish-square
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish to Binance Square, then confirm on Telegram
+        env:
+          SQUARE_KEY: ${{ secrets.BINANCE_SQUARE_KEY }}
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHATS: ${{ secrets.TELEGRAM_CHAT_ID }}
+          POST_TEXT: ${{ inputs.text }}
+          POST_META: ${{ inputs.meta }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request, urllib.error, sys
+
+          text = os.environ["POST_TEXT"]
+          meta = json.loads(os.environ.get("POST_META") or "{}")
+          key  = os.environ["SQUARE_KEY"]
+
+          def http(url, payload, headers, timeout=30):
+              req = urllib.request.Request(
+                  url, data=json.dumps(payload).encode(), headers=headers, method="POST")
+              try:
+                  with urllib.request.urlopen(req, timeout=timeout) as r:
+                      return r.status, r.read().decode("utf-8", "replace")
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read().decode("utf-8", "replace")
+
+          print("--- publishing ---")
+          print(text)
+
+          status, raw = http(
+              "https://www.binance.com/bapi/composite/v1/public/pgc/openApi/content/add",
+              {"contentType": 1, "bodyTextOnly": text},
+              {"X-Square-OpenAPI-Key": key, "Content-Type": "application/json",
+               "clienttype": "binanceSkill"},
+          )
+
+          link, note, ok = None, None, False
+          if status == 504:
+              # Binance documents this: the post landed but no id came back. Never retry.
+              ok, note = True, "published, but Binance returned no link for this one"
+          else:
+              try:
+                  j = json.loads(raw)
+              except ValueError:
+                  print(f"::error::non-JSON {status}: {raw[:300]}")
+                  sys.exit(1)
+              if j.get("code") == "000000":
+                  ok = True
+                  data = j.get("data") or {}
+                  link = data.get("shareLink")
+                  print(f"published id={data.get('id')} link={link}")
+              else:
+                  print(f"::error::Binance rejected [{j.get('code')}] {j.get('message')}")
+                  sys.exit(1)
+
+          # Telegram confirmation. Never fails the job -- the post is already live and
+          # must not be republished just because the notification did not send.
+          tg_token = os.environ.get("TG_TOKEN", "").strip()
+          chats = [c.strip() for c in os.environ.get("TG_CHATS", "").split(",") if c.strip()]
+          if ok and tg_token and chats:
+              shown = link or (f"({note})" if note else "(link unavailable)")
+              msg = (
+                  "✅ Posted to Binance Square\n\n"
+                  f"{meta.get('ticker','')} — {meta.get('direction','')}\n"
+                  f"Entry: {meta.get('entry','')}\n"
+                  f"SL: {meta.get('sl','')}\n"
+                  f"TP: {meta.get('tps','')}\n\n"
+                  f"{shown}\n\n"
+                  f"Post {meta.get('used','?')}/{meta.get('cap','?')} today"
+              )
+              for cid in chats:
+                  try:
+                      st, body = http(
+                          f"https://api.telegram.org/bot{tg_token}/sendMessage",
+                          {"chat_id": cid, "text": msg, "disable_web_page_preview": False},
+                          {"Content-Type": "application/json"},
+                      )
+                      print(f"telegram {cid}: {st}")
+                      if st != 200:
+                          print(f"::warning::telegram {cid} failed: {body[:200]}")
+                  except Exception as exc:
+                      print(f"::warning::telegram {cid} threw: {exc}")
+          PY

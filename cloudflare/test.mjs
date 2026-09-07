@@ -122,14 +122,9 @@ const fails2 = [];
 console.log(`all checks passed — post structure verified line by line, ${heads.size} headers x ${descs.size} descriptions`);
 console.log("\nsample:\n" + out);
 
-// --- Telegram confirmation carries the Binance link ---
-import { confirmationText } from "./src/worker.js";
-const conf = confirmationText(s, { ok: true, link: "https://www.binance.com/square/post/12345" }, { used: 12, cap: 95 });
-if (!conf.includes("https://www.binance.com/square/post/12345")) fails2.push("confirmation is missing the post link");
-if (!conf.includes("$AAVE")) fails2.push("confirmation is missing the ticker");
-if (!conf.includes("12/95")) fails2.push("confirmation is missing the quota");
-// the 504 case must say so rather than showing a broken/absent link
-const conf504 = confirmationText(s, { ok: true, link: null, note: "success_without_post_id" }, { used: 1, cap: 95 });
-if (!/no link/i.test(conf504)) fails2.push("504 case does not explain the missing link");
-if (fails2.length) { console.log("CONFIRMATION FAILED:"); fails2.forEach(f=>console.log("  -",f)); process.exit(1); }
-console.log("\nconfirmation message:\n" + conf);
+// --- the publish hop is delegated, not done in the Worker ---
+const wsrc = readFileSync("./src/worker.js", "utf8");
+eq("worker does not call Binance directly (it is IP-blocked)", /content\/add/.test(wsrc), false);
+eq("worker dispatches to GitHub instead", /actions\/workflows\/\$\{WORKFLOW_FILE\}\/dispatches/.test(wsrc), true);
+eq("dispatch sends a User-Agent (GitHub rejects requests without one)", /"User-Agent": "whale-signals-worker"/.test(wsrc), true);
+eq("204 is treated as success", /res\.status === 204/.test(wsrc), true);
