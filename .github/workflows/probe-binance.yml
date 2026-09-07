@@ -1,0 +1,23 @@
+name: Probe Binance reachability
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Can this runner reach Binance Square?
+        env:
+          KEY: ${{ secrets.BINANCE_SQUARE_KEY }}
+        run: |
+          echo "runner egress IP: $(curl -s https://api.ipify.org)"
+          echo "geo: $(curl -s https://ipinfo.io/country || true)"
+          code=$(curl -s -o /tmp/body.txt -w '%{http_code}' -X POST \
+            "https://www.binance.com/bapi/composite/v2/public/pgc/openApi/image/presignedUrl" \
+            -H "X-Square-OpenAPI-Key: $KEY" \
+            -H "Content-Type: application/json" \
+            -H "clienttype: binanceSkill" \
+            -d '{"imageName":"probe.png"}')
+          echo "HTTP $code"
+          head -c 300 /tmp/body.txt
