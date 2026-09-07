@@ -28,7 +28,9 @@ const CONFIG = {
   maxPostsPerDay: 95,
   minMinutesBetweenPosts: 15, // 15 min => at most 96/day, so the cap cannot be hit
   postToBinanceSquare: true,
-  postToTelegram: false, // Telegram sender kept; flip to true to also post there
+  // Telegram is no longer a destination -- it receives a confirmation with the
+  // Binance post link after each successful publish, so you can verify it landed.
+  telegramConfirm: true,
 };
 
 const SOURCES = [{ key: "whaletracker", channel: "WhaleTracker" }];
@@ -524,7 +526,25 @@ export async function postToSquare(apiKey, text) {
   return { ok: true, id: json.data?.id ?? null, link: json.data?.shareLink ?? null };
 }
 
-/** Telegram sender, kept for the optional second destination. */
+/** Telegram is used only to confirm a Square post landed, with its link. */
+export function confirmationText(s, result, quota) {
+  const link = result.link
+    ? result.link
+    : result.note === "success_without_post_id"
+      ? "(published, but Binance returned no link for this one)"
+      : "(link unavailable)";
+  return `✅ Posted to Binance Square
+
+${s.ticker} — ${s.direction}
+Entry: ${s.entryLow} - ${s.entryHigh}
+SL: ${s.stop}
+TP: ${s.targets.join(" / ")}
+
+${link}
+
+Post ${quota.used}/${quota.cap} today`;
+}
+
 async function sendTelegram(token, chatId, text) {
   const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: "POST",
@@ -620,28 +640,29 @@ async function runOnce(env, { dryRun = false, force = false } = {}) {
       if (dryRun) {
         log.push(`[dry] ${sig.symbol} ${s.direction} (${eligible.length} eligible, posting newest)\n${text}`);
       } else {
-        let ok = false;
-        if (CONFIG.postToBinanceSquare) {
-          const r = await postToSquare(squareKey, text);
-          if (r.ok) {
-            ok = true;
-            log.push(`square: posted ${sig.symbol} ${s.direction}${r.link ? ` ${r.link}` : ""}${r.note ? ` (${r.note})` : ""}`);
-          } else {
-            log.push(`square: FAILED ${sig.symbol}: ${r.error}`);
-          }
-        }
-        if (CONFIG.postToTelegram && tgToken) {
-          for (const cid of tgChats) {
-            const r = await sendTelegram(tgToken, cid, text);
-            if (r.ok) ok = true;
-            else log.push(`telegram: failed ${cid}: ${r.description}`);
-          }
-        }
-        if (ok) {
+        const r = await postToSquare(squareKey, text);
+        if (!r.ok) {
+          log.push(`square: FAILED ${sig.symbol}: ${r.error}`);
+        } else {
+          log.push(`square: posted ${sig.symbol} ${s.direction}${r.link ? ` ${r.link}` : ""}${r.note ? ` (${r.note})` : ""}`);
           state.quota.count += 1;
           state.quota.lastPostMs = nowMs;
           state.sentTotal = (state.sentTotal || 0) + 1;
           posted += 1;
+
+          // Confirm to Telegram with the link. A failure here must NOT affect the
+          // post -- it is already live on Square and must never be republished.
+          if (CONFIG.telegramConfirm && tgToken) {
+            const note = confirmationText(s, r, { used: state.quota.count, cap: CONFIG.maxPostsPerDay });
+            for (const cid of tgChats) {
+              try {
+                const tr = await sendTelegram(tgToken, cid, note);
+                if (!tr.ok) log.push(`telegram confirm failed ${cid}: ${tr.description}`);
+              } catch (err) {
+                log.push(`telegram confirm threw ${cid}: ${err}`);
+              }
+            }
+          }
         }
       }
     }
@@ -680,6 +701,27 @@ export default {
     if (url.pathname === "/health")
       return json({ ok: true, sources: SOURCES.map((s) => s.channel), destination: CONFIG.postToBinanceSquare ? "binance-square" : "telegram" });
     if (url.pathname === "/state") return json((await env.STATE.get("state", { type: "json" })) || { channels: {} });
+    if (url.pathname === "/probe") {
+      // Diagnostic: can this Worker reach Binance at all? Uses the auth-only image
+      // endpoint so nothing is ever published.
+      const r = await fetch("https://www.binance.com/bapi/composite/v2/public/pgc/openApi/image/presignedUrl", {
+        method: "POST",
+        headers: {
+          "X-Square-OpenAPI-Key": env.BINANCE_SQUARE_KEY || "",
+          "Content-Type": "application/json",
+          clienttype: "binanceSkill",
+        },
+        body: JSON.stringify({ imageName: "probe.png" }),
+      });
+      const body = (await r.text()).slice(0, 300);
+      return json({
+        status: r.status,
+        colo: request.cf?.colo ?? null,
+        country: request.cf?.country ?? null,
+        cfRay: r.headers.get("cf-ray"),
+        body,
+      });
+    }
     if (url.pathname === "/dry") return json(await runOnce(env, { dryRun: true }));
     if (url.pathname === "/run") {
       if (env.ADMIN_KEY && url.searchParams.get("key") !== env.ADMIN_KEY) return json({ error: "bad key" }, 403);
