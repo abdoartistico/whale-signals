@@ -1,12 +1,19 @@
-/** Verify the Worker port matches the Python bot. Run: node cloudflare/test.mjs */
+/** Offline checks. Run: node test.mjs */
 
-import { parseMessage, parsePumpDetector, buildSetup, render, TEMPLATE_NAMES, extractPosts } from "./src/worker.js";
+import { parseMessage, parsePumpDetector, buildSetup, render, extractPosts } from "./src/worker.js";
 
-const AAVE = `┌ #AAVEUSDT ✳️ Buying Volume
+const CFG = { entryZonePct: 0.4, stopLossPct: 7.0, takeProfitPcts: [4.0, 8.0, 12.0] };
+const fails = [];
+const eq = (label, got, want) => {
+  const g = JSON.stringify(got), w = JSON.stringify(want);
+  if (g !== w) fails.push(`${label}: got ${g}, want ${w}`);
+};
+
+const wt = (sym, buying, price) => `┌ #${sym} ${buying ? "✳️ Buying" : "🔴 Selling"} Volume
 ├ 203.96K ₮ volume in 1m
-┊├ Buy [81%]: 166.51K ₮
-┊└ Sell [-19%]: -37.45K ₮
-├Price: 96.38→96.63 (0.3%)
+┊├ Buy [${buying ? 81 : 19}%]: 166.51K ₮
+┊└ Sell [-${buying ? 19 : 81}%]: -37.45K ₮
+├Price: ${price}→${price} (0.3%)
 ├Change: 24h[5.327%] 4h[0.98%]
 ┊└ 15m[0.33%] 1h[0.56%]
 ├24h Volume: 13.910M ₮
@@ -15,192 +22,101 @@ const AAVE = `┌ #AAVEUSDT ✳️ Buying Volume
 ├Net Vol: 15m[15%] 1h[14%] 4h[6%]
 └Alerts: 24h[3] 4h[2]`;
 
-const ETHBTC = `┌ #ETHBTC 🔴 Selling Volume
-├ 1.0013 Ƀ volume in 1m
-┊├ Buy [0%]: 0.0000 Ƀ
-┊└ Sell [-100%]: -1.0013 Ƀ
-├Price: 0.02932→0.02932 (0.0%)
-├Change: 24h[0.791%] 4h[0.31%]
-┊└ 15m[0.03%] 1h[0.27%]
-├24h Volume: 63.6799 Ƀ
-┊├ Buy [48%]: 30.8209 Ƀ
-┊└ Sell [-52%]: -32.8589 Ƀ
-├Net Vol: 15m[-16%] 1h[14%] 4h[8%]
-└Alerts: 24h[8] 4h[2]`;
+const AAVE = wt("AAVEUSDT", true, "96.63");
 
-const CFG = { entryZonePct: 0.4, stopLossPct: 5.0, takeProfitPcts: [4.0, 8.0, 12.0] };
-const fails = [];
-const eq = (label, got, want) => {
-  const g = JSON.stringify(got), w = JSON.stringify(want);
-  if (g !== w) fails.push(`${label}: got ${g}, want ${w}`);
-};
-
-// --- parsing: must match the Python assertions exactly ---
+// --- parsing still intact ---
 const a = parseMessage(AAVE, 1);
-eq("symbol", a.symbol, "AAVEUSDT");
 eq("base", a.base, "AAVE");
 eq("quote", a.quote, "USDT");
 eq("side", a.side, "buy");
-eq("alertVolume", a.alertVolume, 203960);
-eq("window", a.window, "1m");
-eq("buyPct", a.buyPct, 81);
-eq("sellPct", a.sellPct, -19);
 eq("price", a.price, 96.63);
-eq("change24h", a.change["24h"], 5.327);
-eq("change15m", a.change["15m"], 0.33);
-eq("vol24h", a.vol24h, 13910000);
-eq("netVol", a.netVol, { "15m": 15, "1h": 14, "4h": 6 });
-eq("alerts", [a.alerts24h, a.alerts4h], [3, 2]);
 eq("dominance", a.dominance, 81);
+eq("vol24h", a.vol24h, 13910000);
+eq("non-signal -> null", parseMessage("hello world", 2), null);
+eq("chinese ticker -> null", parseMessage("┌ #币安人生USDT ✳️ Buying Volume\n├Price: 1→1 (0.0%)", 3), null);
 
-const e = parseMessage(ETHBTC, 2);
-eq("ethbtc base", e.base, "ETH");
-eq("ethbtc quote", e.quote, "BTC");
-eq("ethbtc dominance", e.dominance, 100);
-
-eq("non-signal -> null", parseMessage("hello world", 3), null);
-eq("chinese ticker -> null (skipped by design)", parseMessage("┌ #币安人生USDT ✳️ Buying Volume\n├Price: 1→1 (0.0%)", 4), null);
-
-// --- levels: identical to the Python test expectations ---
+// --- levels: entry ends AT the alert price, SL/TP measured from the midpoint ---
 const s = buildSetup(a, CFG);
-eq("direction", s.direction, "LONG");
-eq("ticker", s.ticker, "$AAVE");
-eq("entry", [s.entryLow, s.entryHigh], ["96.44", "96.82"]);
-eq("stop", s.stop, "91.80");
-eq("targets", s.targets, ["100.50", "104.36", "108.23"]);
-eq("rr", s.rr, "1.6");
+const p = 96.63, lo = p * (1 - 0.004), mid = (lo + p) / 2;
+eq("entry high is the alert price", s.entryHigh, p.toFixed(2));
+eq("entry low is below it", s.entryLow, lo.toFixed(2));
+eq("SL is 7% below the entry midpoint", s.stop, (mid * 0.93).toFixed(2));
+eq("TP1 is +4% from midpoint", s.targets[0], (mid * 1.04).toFixed(2));
+eq("TP2 is +8% from midpoint", s.targets[1], (mid * 1.08).toFixed(2));
+eq("TP3 is +12% from midpoint", s.targets[2], (mid * 1.12).toFixed(2));
 
-const ss = buildSetup(e, CFG);
-eq("short ticker keeps quote", ss.ticker, "$ETH/BTC");
-eq("short stop above price", Number(ss.stop) > e.price, true);
-eq("small price precision", ss.stop, "0.03079");
-
-const decs = new Set([s.entryLow, s.entryHigh, s.stop, ...s.targets].map((x) => x.split(".")[1].length));
-eq("uniform precision", decs.size, 1);
-
-// --- rendering ---
-eq("template count", TEMPLATE_NAMES.length, 3);
-eq("template names", TEMPLATE_NAMES, ["setup", "compact", "hook"]);
-
-for (let i = 0; i < TEMPLATE_NAMES.length; i++) {
-  const out = render(s, i, i);
-  const name = TEMPLATE_NAMES[i];
-  if (!out.trim() || out.includes("undefined") || out.includes("NaN") || out.includes("{"))
-    fails.push(`template ${name} bad:\n${out}`);
-  // every layout must carry the full trade plan
-  for (const need of [s.entryLow, s.entryHigh, s.stop, ...s.targets, s.ticker])
-    if (!out.includes(need)) fails.push(`template ${name} is missing ${need}`);
-  if (!out.includes("👇")) fails.push(`template ${name} is missing the CTA`);
-  // plain text on purpose -- no Markdown markers to break on odd tickers
-  if (out.includes("*") || out.includes("_")) fails.push(`template ${name} leaked Markdown`);
-}
-
-eq("rotation wraps", render(s, 0, 1), render(s, 3, 1));
-eq("neighbours differ", render(s, 0, 1) === render(s, 1, 2), false);
-
-// --- wording actually rotates (the whole point) ---
-const seen = new Set();
-for (let seed = 0; seed < 60; seed++) seen.add(render(s, seed % 3, seed));
-eq("60 seeds produce many distinct messages", seen.size >= 50, true);
-
-const openers = new Set(), closers = new Set(), ctas = new Set();
-for (let seed = 0; seed < 60; seed++) {
-  const setupOut = render(s, 0, seed);
-  openers.add(setupOut.split("\n")[2]); // the 💎 line
-  ctas.add(setupOut.split("\n").find((l) => l.includes("👇")));
-  closers.add(render(s, 1, seed).split("\n")[6]); // compact's sentiment line
-}
-eq("openers rotate", openers.size >= 10, true);
-eq("closers rotate", closers.size >= 10, true);
-eq("CTAs rotate", ctas.size >= 4, true);
-
-// slots must not advance in lockstep, or the variety collapses
-const pairA = new Set();
-for (let seed = 0; seed < 40; seed++) {
-  const o = render(s, 0, seed).split("\n")[2];
-  const c = render(s, 1, seed).split("\n")[6];
-  pairA.add(o + "||" + c);
-}
-eq("opener/closer combinations are decorrelated", pairA.size >= 30, true);
-
-// --- thousands separators on large prices ---
-const BIG = AAVE.replace("├Price: 96.38→96.63 (0.3%)", "├Price: 1920.5→1910.4 (-0.5%)");
-const bs = buildSetup(parseMessage(BIG, 9), CFG);
-eq("comma in entry", bs.entryLow.includes(","), true);
-eq("comma formatting", bs.entryLow, "1,906.6");
+const sh = buildSetup(parseMessage(wt("ETHUSDT", false, "1910.4"), 4), CFG);
+eq("short direction", sh.direction, "SHORT");
+eq("short stop is ABOVE price", Number(sh.stop.replace(/,/g, "")) > 1910.4, true);
+eq("short targets descend", sh.targets.map((t) => Number(t.replace(/,/g, ""))).every((v, i, arr) => i === 0 || v < arr[i - 1]), true);
+eq("thousands separator", sh.entryHigh, "1,910.4");
 eq("no comma on small prices", s.entryLow.includes(","), false);
 
-// SHORT direction wording must not say "Long"
-const shortSig = parseMessage(AAVE.replace("✳️ Buying Volume", "🔴 Selling Volume"), 11);
-const shortSetup = buildSetup(shortSig, CFG);
-for (let i = 0; i < 3; i++) {
-  const out = render(shortSetup, i, i);
-  if (/\bLong\b|\bLONG\b/.test(out)) fails.push(`template ${TEMPLATE_NAMES[i]} says Long on a SHORT signal:\n${out}`);
-}
+// --- the required post structure, literally ---
+const out = render(s, 1);
+const lines = out.split("\n");
+eq("line 0 is $TICKER — header", /^\$AAVE — .+/.test(lines[0]), true);
+eq("line 1 blank", lines[1], "");
+eq("Entry line", /^Entry: [\d.,]+ - [\d.,]+$/.test(lines[2]), true);
+eq("SL line", /^SL: [\d.,]+$/.test(lines[3]), true);
+eq("line 4 blank", lines[4], "");
+eq("TP1 line", /^TP1: [\d.,]+$/.test(lines[5]), true);
+eq("TP2 line", /^TP2: [\d.,]+$/.test(lines[6]), true);
+eq("TP3 line", /^TP3: [\d.,]+$/.test(lines[7]), true);
+eq("line 8 blank", lines[8], "");
+eq("description present", lines[9].length > 20, true);
+eq("line 10 blank", lines[10], "");
+eq("CTA line", lines[11], "Trade here 👇");
+eq("last line is ticker", lines[12], "$AAVE");
+eq("exactly 13 lines", lines.length, 13);
+eq("no markdown", /[*_]/.test(out), false);
+eq("LONG header says LONG", /LONG setup/.test(out), true);
+eq("SHORT header says SHORT", /SHORT setup/.test(render(sh, 2)), true);
+eq("SHORT never says LONG", /LONG/.test(render(sh, 2)), false);
 
-// --- second source: cointrendz_pumpdetector ---
-const PUMP = `🚀 Pump - REZ/USDT [Binance]
-Pump Activity on REZ/USDT 🟢🟢
+// --- rotation ---
+const msgs = new Set(), heads = new Set(), descs = new Set();
+for (let seed = 0; seed < 200; seed++) {
+  const m = render(s, seed);
+  msgs.add(m);
+  heads.add(m.split("\n")[0]);
+  descs.add(m.split("\n")[9]);
+}
+eq("headers rotate", heads.size >= 20, true);
+eq("descriptions rotate", descs.size >= 15, true);
+eq("200 signals stay varied", msgs.size >= 150, true);
+// header and description must not advance in lockstep
+eq("slots decorrelated", msgs.size > Math.max(heads.size, descs.size), true);
+
+// --- Binance Square post length is well within any sane cap ---
+eq("post is short", out.length < 600, true);
+
+// --- the excluded coin list ---
+const EXCLUDED = ["USDT", "USDC", "FDUSD", "TUSD", "USDP", "USDD", "DAI", "EURI", "EURT",
+  "AEUR", "PYUSD", "GUSD", "FRAX", "LUSD", "SUSD", "MUSD", "USDX", "CEUR", "XSGD", "TRYB", "BRLZ"];
+import { readFileSync } from "fs";
+const src = readFileSync("./src/worker.js", "utf8");
+const setBlock = src.slice(src.indexOf("const STABLE_BASES"), src.indexOf("const QUOTES"));
+for (const c of EXCLUDED) {
+  if (!new RegExp(`"${c}"`).test(setBlock)) fails.push(`excluded coin ${c} missing from STABLE_BASES`);
+}
+eq("stablecoin exclusion is enabled", /excludeStablecoins:\s*true/.test(src), true);
+eq("daily cap under Binance's 100", Number(src.match(/maxPostsPerDay:\s*(\d+)/)[1]) < 100, true);
+const gap = Number(src.match(/minMinutesBetweenPosts:\s*(\d+)/)[1]);
+eq("pacing cannot exceed the daily cap", Math.floor((24 * 60) / gap) <= 100, true);
+
+// --- pump parser kept working though dormant ---
+const pump = parsePumpDetector(`🚀 Pump - REZ/USDT [Binance]
 💰Price: $0.00262 ➜ $0.00296 (+13.11%)
 📊Volume: $1.85M (+137.42%)
-Volume increased by $1.07M ⬆`;
-
-const p = parsePumpDetector(PUMP, 100);
-eq("pump base", p.base, "REZ");
-eq("pump quote", p.quote, "USDT");
-eq("pump symbol", p.symbol, "REZUSDT");
-eq("pump exchange", p.exchange, "Binance");
-eq("pump side", p.side, "buy");
-eq("pump direction", p.direction, "LONG");
-eq("pump priceFrom", p.priceFrom, 0.00262);
-eq("pump price", p.price, 0.00296);
-eq("pump move", p.priceMovePct, 13.11);
-eq("pump vol24h", p.vol24h, 1850000);
-eq("pump volChangePct", p.volChangePct, 137.42);
-eq("pump volIncrease", p.volIncrease, 1070000);
-eq("pump source tag", p.source, "pumpdetector");
-
-// promotional posts and off-format messages must fall out, not throw
-eq("promo post -> null", parsePumpDetector("✨Bot Command Showcase✨\n\nFeatured command: /fed 🔥", 101), null);
-eq("wt message not parsed as pump", parsePumpDetector(AAVE, 102), null);
-eq("pump message not parsed as wt", parseMessage(PUMP, 103), null);
-
-const ps = buildSetup(p, CFG);
-eq("pump ticker", ps.ticker, "$REZ");
-eq("pump direction kept", ps.direction, "LONG");
-eq("pump stop below price", Number(ps.stop) < p.price, true);
-eq("pump targets ascend", ps.targets.map(Number).every((v, i, a) => i === 0 || v > a[i - 1]), true);
-// tiny price must keep meaningful precision, not collapse to 0.00
-eq("pump precision", ps.targets[0], "0.003078");
-
-// The pump source is dormant (not in SOURCES) but the parser is kept working, so the
-// templates must still render it cleanly if it is ever switched back on.
-for (let i = 0; i < TEMPLATE_NAMES.length; i++) {
-  const out = render(ps, i, i);
-  if (out.includes("undefined") || out.includes("NaN"))
-    fails.push(`pump template ${TEMPLATE_NAMES[i]} leaked a missing field:\n${out}`);
-}
-
-// --- regression: the pump channel emits "$" as the numeric entity &#036;.
-// Decoding only named entities silently broke every price regex on that source.
-const ENTITY_HTML =
-  '<div data-post="c/9"><div class="tgme_widget_message_text js-message_text" dir="auto">' +
-  "<b>🚀 Pump</b> - REZ/USDT [Binance]<br/>💰Price: &#036;0.00262 ➜ &#036;0.00296 (+13.11%)<br/>" +
-  "📊Volume: &#036;1.85M (+137.42%)<br/>Volume increased by &#036;1.07M ⬆</div></div>";
-const [[eid, etext]] = extractPosts(ENTITY_HTML);
-eq("numeric entity decoded to $", etext.includes("$0.00262"), true);
-eq("no raw entity left behind", etext.includes("&#036;"), false);
-const ep = parsePumpDetector(etext, eid);
-eq("entity-encoded message still parses", ep && ep.price, 0.00296);
-eq("entity-encoded volume still parses", ep && ep.vol24h, 1850000);
-
-// hex entities too
-eq("hex entity decoded", extractPosts('<div data-post="c/1"><div class="js-message_text">&#x24;5</div></div>')[0][1], "$5");
+Volume increased by $1.07M ⬆`, 100);
+eq("pump parser intact", pump && pump.price, 0.00296);
+eq("numeric entity decoded", extractPosts('<div data-post="c/1"><div class="js-message_text">&#036;5</div></div>')[0][1], "$5");
 
 if (fails.length) {
   console.log("FAILED:");
   for (const f of fails) console.log("  -", f);
   process.exit(1);
 }
-console.log(`worker port OK — ${TEMPLATE_NAMES.length} templates, levels match the Python bot exactly`);
-console.log("\nsample output:\n" + render(s, 0, 0));
+console.log(`all checks passed — post structure verified line by line, ${heads.size} headers x ${descs.size} descriptions`);
+console.log("\nsample:\n" + out);

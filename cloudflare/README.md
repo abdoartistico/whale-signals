@@ -1,27 +1,59 @@
 # Cloudflare Workers version
 
-Same bot, same seven templates, same levels — but on Cloudflare's scheduler instead of
-GitHub's. Runs **every 2 minutes**, reliably, instead of GitHub's "whenever the queue feels
-like it".
+**Destination: Binance Square** (not Telegram). Reads @WhaleTracker, builds a trade setup,
+and publishes it with the Square OpenAPI.
 
-## Sources
+    POST https://www.binance.com/bapi/composite/v1/public/pgc/openApi/content/add
+    X-Square-OpenAPI-Key: <key>     clienttype: binanceSkill
+    { "contentType": 1, "bodyTextOnly": "<post>" }
+    success when code === "000000"; a 504 means published-without-id -- never retry it
 
-Only [@WhaleTracker](https://t.me/WhaleTracker) is active (~24 alerts/hour).
+## Rate limiting (the important part)
 
-`parsePumpDetector` for [@cointrendz_pumpdetector](https://t.me/cointrendz_pumpdetector) is
-kept and still covered by tests, but **dormant** — add
-`{ key: "pumpdetector", channel: "cointrendz_pumpdetector" }` to `SOURCES` to switch it
-back on. Each source keeps independent state in KV, so one going quiet or failing never
-blocks another.
+Binance Square allows **100 posts/day**. WhaleTracker produces **~670 alerts/day**, so only
+about 1 in 7 can be published. Rather than burning the quota in the first few hours and
+going silent, posting is paced:
 
-**Gotcha worth knowing:** the pump channel encodes `$` as the numeric HTML entity `&#036;`.
-`stripHtml` decodes numeric and hex entities for this reason; decoding only named entities
-silently breaks every price regex on that source. There is a regression test for it.
+| Control | Value | Effect |
+|---|---|---|
+| `minMinutesBetweenPosts` | 15 | at most 96 posts/day -- the cap cannot be reached |
+| `maxPostsPerDay` | 95 | hard stop, belt and braces |
+| choice within a window | newest eligible signal | the most tradable one, not the stalest |
 
-Why this exists: GitHub assigns scheduled workflows to priority queues based on account age
-and repo history. A new account/repo lands in a heavily throttled queue where runs are
-delayed by hours or dropped outright, and changing the cron expression does not help.
-Cloudflare Cron Triggers fire on time.
+The daily counter lives in KV and resets on the UTC date rollover, matching Binance's reset.
+Alerts skipped by pacing are dropped, not queued -- a signal held behind a rate limit is
+stale by the time it could be sent.
+
+## Excluded coins
+
+Pegged assets are filtered out (`excludeStablecoins: true`): USDT, USDC, FDUSD, TUSD, USDP,
+USDD, DAI, EURI, EURT, AEUR, PYUSD, GUSD, FRAX, LUSD, SUSD, MUSD, USDX, CEUR, XSGD, TRYB,
+BRLZ, plus RLUSD, BUSD, USDE, USD1, USDS, CRVUSD, USDG, USDY, EURS.
+
+## Post format
+
+One fixed structure; the header and description rotate (24 headers x 20 description
+templates per direction, and descriptions interpolate the alert's real order-flow numbers):
+
+    $SUI — LONG setup demand surging, targets in sight🎯
+
+    Entry: 0.6848 - 0.6876
+    SL: 0.6382
+
+    TP1: 0.7137
+    TP2: 0.7411
+    TP3: 0.7686
+
+    Bullish imbalance building, $740.68K bought against $57.30M of daily volume.
+
+    Trade here 👇
+    $SUI
+
+Levels: entry runs from `price - 0.4%` up to the alert price; SL is 7% from the entry
+midpoint; TPs are +4/+8/+12% from that midpoint (inverted for shorts).
+
+> **Note:** the Python bot in `../bot/` is now OUT OF SYNC -- it still posts the older
+> Telegram format. Production is this Worker.
 
 ## Setup (about 10 minutes)
 

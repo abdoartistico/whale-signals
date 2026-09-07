@@ -1,39 +1,49 @@
 /**
- * WhaleTracker -> Telegram, on Cloudflare Workers.
+ * WhaleTracker -> Binance Square, on Cloudflare Workers.
  *
- * A direct port of the Python bot. Runs on a Cron Trigger every 2 minutes.
- * State (last processed message id + template rotation) lives in Workers KV.
+ * Reads the public WhaleTracker Telegram channel, turns each volume alert into a
+ * trade setup, and publishes it to Binance Square via the Square OpenAPI.
+ * Runs on a Cron Trigger every 2 minutes. State lives in Workers KV.
  *
- * Free-plan budget per invocation: 50 subrequests, 10ms CPU. We use ~5 subrequests
- * and only write KV when something actually changed, to stay under 1,000 writes/day.
+ * Binance Square allows 100 posts/day. WhaleTracker produces ~570 alerts/day, so
+ * posting is paced: at most one post per MIN_MINUTES_BETWEEN_POSTS, hard-capped by
+ * maxPostsPerDay, always choosing the NEWEST eligible signal in the window. Pacing
+ * (rather than posting until the quota dies) keeps coverage spread over 24h.
+ *
+ * Cloudflare free-plan budget per invocation: 50 subrequests, 10ms CPU.
  */
 
 const CONFIG = {
+  // Entry runs from slightly below the alert price UP TO the alert price.
   entryZonePct: 0.4,
-  stopLossPct: 5.0,
+  // Stop loss and targets are measured from the MIDPOINT of the entry range.
+  stopLossPct: 7.0,
   takeProfitPcts: [4.0, 8.0, 12.0],
-  maxSignalsPerRun: 12, // also keeps us well under the 50-subrequest ceiling
-  excludeStablecoins: false,
+
+  excludeStablecoins: true,
   allowShorts: true,
+  usdtPairsOnly: true,
+
+  // Binance Square limits: 100 posts/day. Stay under it with margin.
+  maxPostsPerDay: 95,
+  minMinutesBetweenPosts: 15, // 15 min => at most 96/day, so the cap cannot be hit
+  postToBinanceSquare: true,
+  postToTelegram: false, // Telegram sender kept; flip to true to also post there
 };
 
-// Each source has its own message format and therefore its own parser and its own
-// commentary pool -- the pump channel publishes none of the order-flow statistics
-// the WhaleTracker templates talk about.
-// Only WhaleTracker is active. The pump parser below is kept and tested but dormant --
-// re-enable by adding { key: "pumpdetector", channel: "cointrendz_pumpdetector" } here.
 const SOURCES = [{ key: "whaletracker", channel: "WhaleTracker" }];
 
+// Pegged assets: a 12% target on a $1.00 coin is not a trade.
 const STABLE_BASES = new Set([
-  "USDT", "USDC", "RLUSD", "FDUSD", "TUSD", "BUSD", "DAI", "USDE", "USDD",
-  "PYUSD", "USDP", "FRAX", "LUSD", "GUSD", "EURI", "EURT", "EURS", "USD1",
-  "USDS", "SUSD", "CRVUSD", "USDG", "USDY",
+  "USDT", "USDC", "FDUSD", "TUSD", "USDP", "USDD", "DAI", "EURI", "EURT", "AEUR",
+  "PYUSD", "GUSD", "FRAX", "LUSD", "SUSD", "MUSD", "USDX", "CEUR", "XSGD", "TRYB", "BRLZ",
+  // kept from before
+  "RLUSD", "BUSD", "USDE", "USD1", "USDS", "CRVUSD", "USDG", "USDY", "EURS",
 ]);
 
 const QUOTES = ["USDT", "USDC", "FDUSD", "TUSD", "BTC", "ETH", "BNB", "EUR", "TRY"];
 const STABLE_QUOTES = new Set(["USDT", "USDC", "FDUSD", "TUSD", "USD", ""]);
 const SUFFIX = { K: 1e3, M: 1e6, B: 1e9, T: 1e12 };
-
 // ---------------------------------------------------------------- parsing
 
 function toNumber(raw) {
@@ -266,19 +276,22 @@ function withCommas(s) {
 
 export function buildSetup(sig, cfg) {
   const p = sig.price;
-  const zone = cfg.entryZonePct / 100;
-  const sl = cfg.stopLossPct / 100;
   const long = sig.side === "buy";
 
-  const lo = p * (1 - zone / 2);
-  const hi = p * (1 + zone / 2);
-  const stop = long ? p * (1 - sl) : p * (1 + sl);
-  const targets = cfg.takeProfitPcts.map((t) => (long ? p * (1 + t / 100) : p * (1 - t / 100)));
+  // Entry range: from slightly below the alert price up to the alert price itself.
+  const lo = p * (1 - cfg.entryZonePct / 100);
+  const hi = p;
+  const mid = (lo + hi) / 2;
+
+  // Stop and targets are both measured from the entry midpoint.
+  const sl = cfg.stopLossPct / 100;
+  const stop = long ? mid * (1 - sl) : mid * (1 + sl);
+  const targets = cfg.takeProfitPcts.map((t) => (long ? mid * (1 + t / 100) : mid * (1 - t / 100)));
 
   const dec = precisionFor(p, sig.priceRaw);
   const f = (v) => withCommas(v.toFixed(dec));
-  const risk = Math.abs(p - stop);
-  const reward = Math.abs((targets[1] ?? targets[0]) - p);
+  const risk = Math.abs(mid - stop);
+  const reward = Math.abs((targets[1] ?? targets[0]) - mid);
 
   return {
     signal: sig,
@@ -290,152 +303,155 @@ export function buildSetup(sig, cfg) {
     targets: targets.map(f),
     rr: risk ? (reward / risk).toFixed(1) : "-",
     emoji: long ? "🟢" : "🔴",
-    arrow: long ? "📈" : "📉",
+  };
+}
+// ---------------------------------------------------------------- post text
+//
+// One fixed structure, exactly as specified:
+//
+//   $SYMBOL — <header>
+//
+//   Entry: <low> - <high>
+//   SL: <sl>
+//
+//   TP1: <t1>
+//   TP2: <t2>
+//   TP3: <t3>
+//
+//   <short description>
+//
+//   Trade here 👇
+//   $SYMBOL
+//
+// The header and the description rotate. Descriptions also interpolate the real
+// order-flow numbers from the alert, so two posts about different coins never read
+// alike even when they draw the same phrasing.
+
+const LONG_HEADERS = [
+  "LONG setup big long now, big profit soon🤑",
+  "LONG setup momentum accelerating fast, massive gains incoming🚀",
+  "LONG setup breakout confirmed, ready to smash targets🔥",
+  "LONG setup buyers taking over, upside opening up💪",
+  "LONG setup demand surging, targets in sight🎯",
+  "LONG setup strong bid stepping in, move loading⚡",
+  "LONG setup volume exploding, rally starting🚀",
+  "LONG setup bulls in control, profit window open🤑",
+  "LONG setup accumulation done, expansion next📈",
+  "LONG setup pressure building fast, big candles coming🔥",
+  "LONG setup support holding firm, upside unlocked💎",
+  "LONG setup order flow flipping bullish, ride it📈",
+  "LONG setup dip bought hard, reversal confirmed💪",
+  "LONG setup buyers dominating the tape, targets ahead🎯",
+  "LONG setup momentum igniting, do not miss this🚀",
+  "LONG setup breakout in motion, profit soon🤑",
+  "LONG setup heavy buying detected, move starting⚡",
+  "LONG setup trend turning up, targets loading📈",
+  "LONG setup strength returning fast, upside ready🔥",
+  "LONG setup bids stacking up, squeeze potential💥",
+  "LONG setup fresh demand entering, rally forming🚀",
+  "LONG setup sellers exhausted, buyers stepping in💪",
+  "LONG setup clean entry forming, targets locked🎯",
+  "LONG setup big money buying, follow the flow💎",
+];
+
+const SHORT_HEADERS = [
+  "SHORT setup big drop now, big profit soon📉",
+  "SHORT setup breakdown confirmed, targets below🔻",
+  "SHORT setup sellers taking over, downside opening📉",
+  "SHORT setup supply flooding in, dump loading⚡",
+  "SHORT setup momentum turning down, profit soon💰",
+  "SHORT setup resistance rejected, fall incoming🔻",
+  "SHORT setup heavy selling detected, move starting📉",
+  "SHORT setup bears in control, targets ahead🎯",
+  "SHORT setup distribution done, breakdown next📉",
+  "SHORT setup pressure building down, red candles coming🔻",
+  "SHORT setup bounce sold hard, reversal confirmed📉",
+  "SHORT setup sellers dominating the tape, downside ready💰",
+  "SHORT setup trend turning down, targets loading🔻",
+  "SHORT setup weakness spreading fast, drop ready📉",
+  "SHORT setup asks stacking up, flush potential💥",
+  "SHORT setup fresh supply entering, dump forming🔻",
+  "SHORT setup buyers exhausted, sellers stepping in📉",
+  "SHORT setup clean short forming, targets locked🎯",
+  "SHORT setup big money selling, follow the flow💰",
+  "SHORT setup order flow flipping bearish, ride it🔻",
+  "SHORT setup support broken, downside unlocked📉",
+  "SHORT setup rally faded fast, short window open💰",
+  "SHORT setup volume exploding down, slide starting⚡",
+  "SHORT setup momentum collapsing, do not miss this🔻",
+];
+
+function money(v) {
+  for (const [div, tag] of [[1e9, "B"], [1e6, "M"], [1e3, "K"]]) {
+    if (Math.abs(v) >= div) return `$${(v / div).toFixed(2)}${tag}`;
+  }
+  return `$${Math.round(v).toLocaleString("en-US")}`;
+}
+
+function facts(s) {
+  const g = s.signal;
+  return {
+    dom: `${Math.round(g.dominance)}%`,
+    vol: money(g.alertVolume),
+    vol24: money(g.vol24h),
+    window: g.window || "the last minute",
+    ch24: `${(g.change["24h"] ?? 0) > 0 ? "+" : ""}${(g.change["24h"] ?? 0).toFixed(2)}%`,
+    n15: g.netVol["15m"],
+    n1h: g.netVol["1h"],
+    alerts24: g.alerts24h,
   };
 }
 
-// ---------------------------------------------------------------- templates
-//
-// Three layouts. Each pulls its wording from rotating pools so consecutive posts
-// never read the same: an opener/hook, a closing sentiment line, a call to action,
-// and (for the SETUP layout) a follow line.
-//
-// 3 layouts x 24 openers x 24 closers x 6 CTAs = ~10k combinations before repeating.
-// Selection is seeded off the message id -- deterministic, but decorrelated per slot
-// so the parts don't advance in lockstep.
-//
-// Plain text on purpose: no Markdown markers, so no parse failures on odd tickers.
-
-const LONG_OPENERS = [
-  "Strong buying pressure is increasing.",
-  "Momentum is building above support.",
-  "Buyers are stepping in with size.",
-  "Demand is picking up fast.",
-  "Accumulation is showing on the tape.",
-  "Buying volume is expanding.",
-  "Bulls are taking control here.",
-  "Support is holding firm.",
-  "Order flow has flipped bullish.",
-  "Buyers are defending this zone.",
-  "Upside pressure is building.",
-  "A breakout attempt is developing.",
-  "Volume is confirming the move up.",
-  "Dips are being bought aggressively.",
-  "Strength is returning after the pullback.",
-  "Bullish momentum is accelerating.",
-  "Buyers are absorbing the offers.",
-  "Interest is rotating into this pair.",
-  "The trend is turning up.",
-  "Fresh demand is entering the market.",
-  "Price is coiling for a move higher.",
-  "Sellers are running out of steam.",
-  "Higher lows are forming.",
-  "Continuation looks likely from here.",
+const LONG_DESCS = [
+  (f) => `Order book is leaning hard to the bid: ${f.dom} of ${f.vol} traded in ${f.window} was buying.`,
+  (f) => `Momentum check — ${f.vol} of demand in ${f.window} against ${f.vol24} daily turnover.`,
+  (f) => `Buyers absorbed the offers with ${f.dom} dominance, and the pair is ${f.ch24} on the day.`,
+  (f) => `Fresh bid stepping in: ${f.vol} bought in ${f.window} while net volume stays positive.`,
+  (f) => `Tape reads bullish — ${f.dom} buy-side pressure on ${f.vol24} of 24h volume.`,
+  (f) => `Accumulation showing up in the flow, ${f.vol} lifted in ${f.window} without much resistance.`,
+  (f) => `Liquidity is being taken on the ask side, ${f.dom} of the last burst was buying.`,
+  (f) => `Demand outpacing supply here: ${f.vol} in ${f.window}, day change ${f.ch24}.`,
+  (f) => `Volume profile is tilting up, with ${f.dom} of ${f.vol} hitting the offer.`,
+  (f) => `Buy-side aggression detected — ${f.vol} in ${f.window} on ${f.vol24} daily turnover.`,
+  (f) => `Order flow flipped: ${f.dom} buying pressure and this is alert ${f.alerts24} today.`,
+  (f) => `Strong bid defending the level, ${f.vol} absorbed in ${f.window}.`,
+  (f) => `Fundamentals aside, the tape is doing the talking: ${f.dom} of ${f.vol} was buying.`,
+  (f) => `Participation picking up fast, ${f.vol24} traded in 24h and the pair sits ${f.ch24}.`,
+  (f) => `Sellers stepping aside as ${f.vol} of demand cleared the book in ${f.window}.`,
+  (f) => `Buying interest concentrated here — ${f.dom} dominance and rising net volume.`,
+  (f) => `Real money on the bid: ${f.vol} in ${f.window}, well above the usual pace.`,
+  (f) => `Book is thin above and buyers are lifting it, ${f.dom} of the flow was aggressive.`,
+  (f) => `Bullish imbalance building, ${f.vol} bought against ${f.vol24} of daily volume.`,
+  (f) => `Repeat interest — ${f.alerts24} alerts today, latest ${f.vol} at ${f.dom} buy dominance.`,
 ];
 
-const SHORT_OPENERS = [
-  "Strong selling pressure is increasing.",
-  "Momentum is breaking down below resistance.",
-  "Sellers are stepping in with size.",
-  "Supply is picking up fast.",
-  "Distribution is showing on the tape.",
-  "Selling volume is expanding.",
-  "Bears are taking control here.",
-  "Resistance is capping every bounce.",
-  "Order flow has flipped bearish.",
-  "Sellers are defending this zone.",
-  "Downside pressure is building.",
-  "A breakdown is developing.",
-  "Volume is confirming the move down.",
-  "Rallies are being sold aggressively.",
-  "Weakness is returning after the bounce.",
-  "Bearish momentum is accelerating.",
-  "Sellers are hitting the bids.",
-  "Money is rotating out of this pair.",
-  "The trend is turning down.",
-  "Fresh supply is entering the market.",
-  "Price is rolling over.",
-  "Buyers are running out of steam.",
-  "Lower highs are forming.",
-  "Continuation lower looks likely from here.",
-];
-
-const LONG_CLOSERS = [
-  "Buying interest remains strong, keeping the bullish trend intact as long as support holds. 📈",
-  "Buyers are defending key levels and momentum stays positive while this zone holds.",
-  "Price is showing strength after the recent dip, with buyers active on every pullback.",
-  "As long as the entry zone holds, continuation toward the targets stays on the table. 📈",
-  "Demand is outpacing supply here, and the structure stays bullish above the stop.",
-  "Momentum favours the upside while price holds above support. 🚀",
-  "Accumulation continues and dips keep getting absorbed by buyers.",
-  "The bullish structure remains valid unless the stop level gives way.",
-  "Buyers are in control and the path of least resistance points higher. 📈",
-  "Strength is building steadily, and a push toward the targets looks reasonable.",
-  "Support has held cleanly, which keeps the upside scenario alive.",
-  "Volume is backing the move, suggesting real interest rather than a fake push.",
-  "The setup stays valid while price consolidates above the entry zone.",
-  "Buyers keep defending, and a continuation move is possible if this level holds. 📈",
-  "Pressure is on the upside, with sellers struggling to push price lower.",
-  "Trend and momentum are aligned to the upside for now. 🚀",
-  "Interest is picking up and the reaction off support has been strong.",
-  "This zone has attracted consistent buying, keeping the bias bullish.",
-  "A hold above the entry zone keeps the targets in play.",
-  "Bulls remain in charge while the stop level stays untouched. 📈",
-  "The pullback looks corrective, with the larger move still pointing up.",
-  "Buyers are absorbing supply, which often precedes an expansion higher.",
-  "Momentum remains constructive as long as the structure holds.",
-  "Risk stays defined at the stop while the upside targets remain open. 📈",
-];
-
-const SHORT_CLOSERS = [
-  "Selling interest remains strong, keeping the bearish trend intact as long as resistance holds. 📉",
-  "Sellers are defending key levels and momentum stays negative while this zone caps price.",
-  "Price is showing weakness after the recent bounce, with sellers active on every rally.",
-  "As long as price stays under the entry zone, continuation toward the targets stays on the table. 📉",
-  "Supply is outpacing demand here, and the structure stays bearish below the stop.",
-  "Momentum favours the downside while price holds below resistance. 🔻",
-  "Distribution continues and rallies keep getting sold.",
-  "The bearish structure remains valid unless the stop level is reclaimed.",
-  "Sellers are in control and the path of least resistance points lower. 📉",
-  "Weakness is building steadily, and a push toward the targets looks reasonable.",
-  "Resistance has held cleanly, which keeps the downside scenario alive.",
-  "Volume is backing the move, suggesting real selling rather than a shakeout.",
-  "The setup stays valid while price consolidates below the entry zone.",
-  "Sellers keep pressing, and a continuation move is possible if this level caps price. 📉",
-  "Pressure is on the downside, with buyers struggling to lift price.",
-  "Trend and momentum are aligned to the downside for now. 🔻",
-  "Selling is picking up and the rejection from resistance has been clean.",
-  "This zone has attracted consistent selling, keeping the bias bearish.",
-  "Staying below the entry zone keeps the targets in play.",
-  "Bears remain in charge while the stop level holds. 📉",
-  "The bounce looks corrective, with the larger move still pointing down.",
-  "Sellers are absorbing bids, which often precedes an expansion lower.",
-  "Momentum remains weak as long as the structure holds.",
-  "Risk stays defined at the stop while the downside targets remain open. 📉",
-];
-
-const CTAS = [
-  "Open your trade 👇",
-  "Trade from here 👇",
-  "Trade here 👇",
-  "Enter from here 👇",
-  "Take the setup here 👇",
-  "Start your trade 👇",
-];
-
-const FOLLOW_LINES = [
-  "✅ Follow for more high-quality trade setups.",
-  "✅ Follow for more setups like this.",
-  "✅ More high-quality setups posted daily.",
-  "✅ Stay tuned for more premium setups.",
+const SHORT_DESCS = [
+  (f) => `Order book is leaning hard to the ask: ${f.dom} of ${f.vol} traded in ${f.window} was selling.`,
+  (f) => `Momentum check — ${f.vol} of supply in ${f.window} against ${f.vol24} daily turnover.`,
+  (f) => `Sellers hit the bids with ${f.dom} dominance, and the pair is ${f.ch24} on the day.`,
+  (f) => `Fresh supply stepping in: ${f.vol} sold in ${f.window} while net volume stays negative.`,
+  (f) => `Tape reads bearish — ${f.dom} sell-side pressure on ${f.vol24} of 24h volume.`,
+  (f) => `Distribution showing up in the flow, ${f.vol} dumped in ${f.window} with weak bids.`,
+  (f) => `Liquidity is being taken on the bid side, ${f.dom} of the last burst was selling.`,
+  (f) => `Supply outpacing demand here: ${f.vol} in ${f.window}, day change ${f.ch24}.`,
+  (f) => `Volume profile is tilting down, with ${f.dom} of ${f.vol} hitting the bid.`,
+  (f) => `Sell-side aggression detected — ${f.vol} in ${f.window} on ${f.vol24} daily turnover.`,
+  (f) => `Order flow flipped: ${f.dom} selling pressure and this is alert ${f.alerts24} today.`,
+  (f) => `Bids getting pulled as ${f.vol} of supply cleared the book in ${f.window}.`,
+  (f) => `Fundamentals aside, the tape is doing the talking: ${f.dom} of ${f.vol} was selling.`,
+  (f) => `Participation picking up fast, ${f.vol24} traded in 24h and the pair sits ${f.ch24}.`,
+  (f) => `Buyers stepping aside while ${f.vol} of supply pressured the book in ${f.window}.`,
+  (f) => `Selling interest concentrated here — ${f.dom} dominance and falling net volume.`,
+  (f) => `Real size on the offer: ${f.vol} in ${f.window}, well above the usual pace.`,
+  (f) => `Book is thin below and sellers are pressing it, ${f.dom} of the flow was aggressive.`,
+  (f) => `Bearish imbalance building, ${f.vol} sold against ${f.vol24} of daily volume.`,
+  (f) => `Persistent supply — ${f.alerts24} alerts today, latest ${f.vol} at ${f.dom} sell dominance.`,
 ];
 
 /**
- * Integer hash, so each slot is picked independently of the others.
- *
- * A linear stride (seed * salt) looks varied but makes the slots move in lockstep:
- * the whole message then repeats with a period equal to the pool size. Hashing gives
- * each slot an effectively independent draw, so combinations run into the thousands.
+ * Integer hash so each rotating slot is drawn independently.
+ * A linear stride (seed * salt) makes the slots move in lockstep, which collapses the
+ * variety to the pool length; hashing keeps header and description uncorrelated.
  */
 function hash32(x) {
   x = (x ^ 61) ^ (x >>> 16);
@@ -448,106 +464,111 @@ function hash32(x) {
 
 const pick = (pool, seed, salt) => pool[hash32(Math.imul(seed, 0x9e3779b1) + Math.imul(salt, 0x85ebca6b)) % pool.length];
 
-function parts(s, seed) {
+export function render(s, seed) {
   const long = s.direction === "LONG";
-  return {
-    opener: pick(long ? LONG_OPENERS : SHORT_OPENERS, seed, 1),
-    closer: pick(long ? LONG_CLOSERS : SHORT_CLOSERS, seed, 7),
-    cta: pick(CTAS, seed, 13),
-    follow: pick(FOLLOW_LINES, seed, 5),
-  };
-}
+  const header = pick(long ? LONG_HEADERS : SHORT_HEADERS, seed, 1);
+  const desc = pick(long ? LONG_DESCS : SHORT_DESCS, seed, 7)(facts(s));
 
-const TEMPLATES = [
-  function setup(s, p) {
-    return `🔥 ${s.direction} SETUP — ${s.ticker}
+  return `${s.ticker} — ${header}
 
-💎 ${p.opener}
-
-Entry Zone: ${s.entryLow} – ${s.entryHigh}
-
-🛡️ Stop Loss: ${s.stop}
-
-🎯 Take Profit:
- TP1: ${s.targets[0]}
- TP2: ${s.targets[1]}
- TP3: ${s.targets[2]}
-
-${p.follow}
-
-${p.cta}
-
-${s.ticker}`;
-  },
-
-  function compact(s, p) {
-    return `${s.ticker} — ${s.direction} ${s.emoji}
-Entry: ${s.entryLow} – ${s.entryHigh}
+Entry: ${s.entryLow} - ${s.entryHigh}
 SL: ${s.stop}
+
 TP1: ${s.targets[0]}
 TP2: ${s.targets[1]}
 TP3: ${s.targets[2]}
-${p.closer}
-${p.cta}
+
+${desc}
+
+Trade here 👇
 ${s.ticker}`;
-  },
-
-  function hook(s, p) {
-    return `${s.ticker} – ${p.opener}
-${s.direction === "LONG" ? "Long" : "Short"} ${s.ticker}
-Entry: ${s.entryLow} – ${s.entryHigh}
-SL: ${s.stop}
-TP1: ${s.targets[0]}
-TP2: ${s.targets[1]}
-TP3: ${s.targets[2]}
-${p.closer}
-${p.cta}
-${s.ticker}`;
-  },
-];
-
-export const TEMPLATE_NAMES = TEMPLATES.map((f) => f.name);
-
-export function render(s, index, seed) {
-  return TEMPLATES[index % TEMPLATES.length](s, parts(s, seed));
 }
-// ---------------------------------------------------------------- telegram
+// ---------------------------------------------------------------- publishing
 
-async function sendMessage(token, chatId, text) {
-  const post = (body) =>
-    fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+const SQUARE_URL = "https://www.binance.com/bapi/composite/v1/public/pgc/openApi/content/add";
+
+/**
+ * Publish a short text post to Binance Square.
+ * Schema and semantics mirror Binance's own square-post client:
+ *   POST /content/add  { contentType: 1, bodyTextOnly }
+ *   success when code === "000000"; a 504 on this endpoint means the post landed
+ *   but the id could not be returned, so it must NOT be retried.
+ */
+export async function postToSquare(apiKey, text) {
+  let res;
+  try {
+    res = await fetch(SQUARE_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }).then((r) => r.json());
+      headers: {
+        "X-Square-OpenAPI-Key": apiKey,
+        "Content-Type": "application/json",
+        clienttype: "binanceSkill",
+      },
+      body: JSON.stringify({ contentType: 1, bodyTextOnly: text }),
+    });
+  } catch (err) {
+    return { ok: false, error: `network: ${err}` };
+  }
 
-  // Templates are plain text, so no parse_mode: nothing to mis-parse on odd tickers.
-  return post({ chat_id: chatId, text, disable_web_page_preview: true });
+  // Documented by Binance: treat as published, do not retry or it double-posts.
+  if (res.status === 504) return { ok: true, id: null, note: "success_without_post_id" };
+
+  const raw = await res.text();
+  let json;
+  try {
+    json = JSON.parse(raw);
+  } catch {
+    return { ok: false, error: `non-JSON ${res.status}: ${raw.slice(0, 160)}` };
+  }
+  if (json.code !== "000000") return { ok: false, error: `[${json.code}] ${json.message}`, code: json.code };
+  return { ok: true, id: json.data?.id ?? null, link: json.data?.shareLink ?? null };
 }
 
+/** Telegram sender, kept for the optional second destination. */
+async function sendTelegram(token, chatId, text) {
+  const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true }),
+  });
+  return res.json();
+}
 // ---------------------------------------------------------------- main
 
-async function runOnce(env, { dryRun = false } = {}) {
-  const token = env.TELEGRAM_BOT_TOKEN;
-  const chatIds = (env.TELEGRAM_CHAT_ID || "").split(",").map((c) => c.trim()).filter(Boolean);
-  const channel = env.SOURCE_CHANNEL || ""; // optional: restrict this run to one channel
-  if (!token || !chatIds.length) return { error: "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set" };
+const utcDay = (ms) => new Date(ms).toISOString().slice(0, 10);
 
+/** Reset the daily counter when the UTC date rolls over (Binance quotas reset 00:00 UTC). */
+function rollQuota(state, nowMs) {
+  const today = utcDay(nowMs);
+  if (!state.quota || state.quota.date !== today) {
+    state.quota = { date: today, count: 0, lastPostMs: state.quota?.lastPostMs || 0 };
+    return true;
+  }
+  return false;
+}
+
+async function runOnce(env, { dryRun = false, force = false } = {}) {
+  const squareKey = env.BINANCE_SQUARE_KEY || "";
+  const tgToken = env.TELEGRAM_BOT_TOKEN || "";
+  const tgChats = (env.TELEGRAM_CHAT_ID || "").split(",").map((c) => c.trim()).filter(Boolean);
+
+  if (CONFIG.postToBinanceSquare && !squareKey && !dryRun) {
+    return { error: "BINANCE_SQUARE_KEY is not set" };
+  }
+
+  const nowMs = Date.now();
   const stored = await env.STATE.get("state", { type: "json" });
   const state = stored || { templateIndex: 0, sentTotal: 0, channels: {} };
   if (!state.channels) state.channels = {};
-  // migrate the single-source layout that predates the pump channel
   if (state.lastId && state.channels.whaletracker === undefined) state.channels.whaletracker = state.lastId;
-
-  // honour an explicit SOURCE_CHANNEL override, otherwise run every configured source
-  const sources = channel ? SOURCES.filter((s) => s.channel === channel) : SOURCES;
+  const rolled = rollQuota(state, nowMs);
 
   const log = [];
   const perSource = {};
-  let sent = 0;
-  let changed = false;
+  let posted = 0;
+  let changed = rolled;
 
-  for (const src of sources) {
+  for (const src of SOURCES) {
     const since = state.channels[src.key] || 0;
     let posts;
     try {
@@ -556,7 +577,7 @@ async function runOnce(env, { dryRun = false } = {}) {
       });
       if (!res.ok) {
         log.push(`${src.key}: fetch failed ${res.status}`);
-        continue; // one dead source must not stop the other
+        continue;
       }
       posts = extractPosts(await res.text());
     } catch (err) {
@@ -566,76 +587,104 @@ async function runOnce(env, { dryRun = false } = {}) {
 
     const fresh = posts.filter(([id]) => id > since).sort((a, b) => a[0] - b[0]);
     const highest = posts.reduce((m, [id]) => Math.max(m, id), since);
-    let sentHere = 0;
 
+    // Everything that survives the coin filter, newest last.
+    const eligible = [];
     for (const [id, text] of fresh) {
-      if (sent >= CONFIG.maxSignalsPerRun) {
-        log.push(`${src.key}: per-run cap ${CONFIG.maxSignalsPerRun} reached, rest deferred`);
-        break;
-      }
       const sig = PARSERS[src.key](text, id);
       if (!sig) continue;
+      if (CONFIG.usdtPairsOnly && !STABLE_QUOTES.has(sig.quote)) continue;
       if (CONFIG.excludeStablecoins && STABLE_BASES.has(sig.base)) continue;
       if (!CONFIG.allowShorts && sig.side === "sell") continue;
-
-      const s = buildSetup(sig, CONFIG);
-      const idx = state.templateIndex;
-      const out = render(s, idx, id);
-
-      if (dryRun) {
-        log.push(`[dry] ${src.key} ${sig.symbol} ${s.direction} via ${TEMPLATE_NAMES[idx % TEMPLATE_NAMES.length]}\n${out}`);
-      } else {
-        let delivered = 0;
-        for (const cid of chatIds) {
-          const r = await sendMessage(token, cid, out);
-          if (r.ok) delivered += 1;
-          else log.push(`send failed ${sig.symbol} -> ${cid}: ${r.description}`);
-        }
-        if (!delivered) continue;
-        log.push(`sent ${src.key} ${sig.symbol} ${s.direction} to ${delivered}/${chatIds.length}`);
-      }
-      state.templateIndex = idx + 1;
-      sent += 1;
-      sentHere += 1;
+      eligible.push(sig);
     }
 
-    if (highest !== since || sentHere > 0) {
+    perSource[src.key] = { fetched: posts.length, fresh: fresh.length, eligible: eligible.length, lastId: highest };
+
+    // Rate gates. Binance allows 100 posts/day; we pace instead of burning the quota
+    // in the first hours, and we publish the NEWEST eligible signal in the window.
+    const sinceLastMin = (nowMs - (state.quota.lastPostMs || 0)) / 60000;
+    const quotaLeft = CONFIG.maxPostsPerDay - state.quota.count;
+
+    if (eligible.length === 0) {
+      if (fresh.length) log.push(`${src.key}: ${fresh.length} fresh, none eligible after coin filter`);
+    } else if (quotaLeft <= 0 && !force) {
+      log.push(`daily cap reached (${state.quota.count}/${CONFIG.maxPostsPerDay}), waiting for UTC reset`);
+    } else if (sinceLastMin < CONFIG.minMinutesBetweenPosts && !force) {
+      log.push(`pacing: ${(CONFIG.minMinutesBetweenPosts - sinceLastMin).toFixed(1)} min until next post`);
+    } else {
+      const sig = eligible[eligible.length - 1]; // newest is the most tradable
+      const s = buildSetup(sig, CONFIG);
+      const text = render(s, sig.msgId);
+
+      if (dryRun) {
+        log.push(`[dry] ${sig.symbol} ${s.direction} (${eligible.length} eligible, posting newest)\n${text}`);
+      } else {
+        let ok = false;
+        if (CONFIG.postToBinanceSquare) {
+          const r = await postToSquare(squareKey, text);
+          if (r.ok) {
+            ok = true;
+            log.push(`square: posted ${sig.symbol} ${s.direction}${r.link ? ` ${r.link}` : ""}${r.note ? ` (${r.note})` : ""}`);
+          } else {
+            log.push(`square: FAILED ${sig.symbol}: ${r.error}`);
+          }
+        }
+        if (CONFIG.postToTelegram && tgToken) {
+          for (const cid of tgChats) {
+            const r = await sendTelegram(tgToken, cid, text);
+            if (r.ok) ok = true;
+            else log.push(`telegram: failed ${cid}: ${r.description}`);
+          }
+        }
+        if (ok) {
+          state.quota.count += 1;
+          state.quota.lastPostMs = nowMs;
+          state.sentTotal = (state.sentTotal || 0) + 1;
+          posted += 1;
+        }
+      }
+    }
+
+    if (highest !== since) {
+      // Advance past everything seen, posted or not -- skipped alerts are stale by the
+      // next window and must not queue up behind the rate limit.
       state.channels[src.key] = highest;
       changed = true;
     }
-    perSource[src.key] = { fetched: posts.length, fresh: fresh.length, sent: sentHere, lastId: highest };
   }
 
-  // Only write KV when something changed -- the free plan allows 1,000 writes/day,
-  // and both sources share a single key so one run is at most one write.
-  if (changed && !dryRun) {
-    delete state.lastId; // superseded by state.channels
-    state.sentTotal = (state.sentTotal || 0) + sent;
+  if ((changed || posted) && !dryRun) {
+    delete state.lastId;
     await env.STATE.put("state", JSON.stringify(state));
   }
 
-  return { sources: perSource, sent, wroteState: changed && !dryRun, log };
+  return {
+    sources: perSource,
+    posted,
+    quota: { used: state.quota.count, cap: CONFIG.maxPostsPerDay, date: state.quota.date },
+    log,
+  };
 }
 
 export default {
-  // Cron Trigger
   async scheduled(event, env, ctx) {
     ctx.waitUntil(runOnce(env).then((r) => console.log(JSON.stringify(r))));
   },
 
-  // Manual endpoints for testing:  /run  /dry  /state  /health
   async fetch(request, env) {
     const url = new URL(request.url);
     const json = (o, status = 200) =>
       new Response(JSON.stringify(o, null, 2), { status, headers: { "content-type": "application/json" } });
 
-    if (url.pathname === "/health") return json({ ok: true, sources: SOURCES.map((s) => s.channel) });
+    if (url.pathname === "/health")
+      return json({ ok: true, sources: SOURCES.map((s) => s.channel), destination: CONFIG.postToBinanceSquare ? "binance-square" : "telegram" });
     if (url.pathname === "/state") return json((await env.STATE.get("state", { type: "json" })) || { channels: {} });
     if (url.pathname === "/dry") return json(await runOnce(env, { dryRun: true }));
     if (url.pathname === "/run") {
       if (env.ADMIN_KEY && url.searchParams.get("key") !== env.ADMIN_KEY) return json({ error: "bad key" }, 403);
-      return json(await runOnce(env));
+      return json(await runOnce(env, { force: url.searchParams.get("force") === "1" }));
     }
-    return json({ endpoints: ["/health", "/state", "/dry", "/run?key=..."] });
+    return json({ endpoints: ["/health", "/state", "/dry", "/run?key=...&force=1"] });
   },
 };
