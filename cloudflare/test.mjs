@@ -92,8 +92,15 @@ eq("slots decorrelated", msgs.size > Math.max(heads.size, descs.size), true);
 eq("post is short", out.length < 600, true);
 
 // --- the excluded coin list ---
-const EXCLUDED = ["USDT", "USDC", "FDUSD", "TUSD", "USDP", "USDD", "DAI", "EURI", "EURT",
-  "AEUR", "PYUSD", "GUSD", "FRAX", "LUSD", "SUSD", "MUSD", "USDX", "CEUR", "XSGD", "TRYB", "BRLZ"];
+const EXCLUDED = [
+  "USDT", "USDC", "BFUSD", "XUSD", "U", "FDUSD", "TUSD", "DAI", "USDP", "PYUSD", "USDD",
+  "USDE", "GUSD", "FRAX", "LUSD", "SUSD", "ALUSD", "USDTB", "EURT", "EURS", "BRL", "BRLZ",
+  "BUSD", "CADC", "NZDS", "TRYB", "GYEN", "JPYC", "XSGD", "EURL", "EURCV", "VEUR", "CNHT",
+  "MIM", "CRVUSD", "DOLA", "HUSD", "OUSD", "USDX", "USN", "VAI", "STBL", "CUSD", "DJED",
+  "AGEUR", "EEUR", "CEUR", "SEURO", "PAR", "MUSD", "EUSD", "TOR", "FEI", "USDV", "BOLD",
+  "GRAI", "PRISMA", "USH", "YUSD", "ZUSD", "USDS", "USD0", "HYUSD", "MIMA", "BRLA", "ARS",
+  "TRYG", "ZARV", "NGNV", "MXNT", "UAHC", "CNH", "IDRT", "PAXG", "XAUT", "PEPE"
+];
 import { readFileSync } from "fs";
 const src = readFileSync("./src/worker.js", "utf8");
 const setBlock = src.slice(src.indexOf("const STABLE_BASES"), src.indexOf("const QUOTES"));
@@ -113,18 +120,19 @@ Volume increased by $1.07M ⬆`, 100);
 eq("pump parser intact", pump && pump.price, 0.00296);
 eq("numeric entity decoded", extractPosts('<div data-post="c/1"><div class="js-message_text">&#036;5</div></div>')[0][1], "$5");
 
+// --- the publish hop is delegated, not done in the Worker ---
+const wsrc = readFileSync("./src/worker.js", "utf8");
+// The Worker must never hold a binance.com URL: its IP is blocked, so any direct
+// call would 403. Comments may mention the endpoint; code may not contain the host.
+eq("worker has no binance.com request URL", /["\x60]https:\/\/www\.binance\.com/.test(wsrc), false);
+eq("worker dispatches to GitHub instead", /actions\/workflows\/\$\{WORKFLOW_FILE\}\/dispatches/.test(wsrc), true);
+eq("dispatch sends a User-Agent (GitHub rejects requests without one)", /"User-Agent": "whale-signals-worker"/.test(wsrc), true);
+eq("204 is treated as success", /res\.status === 204/.test(wsrc), true);
+
 if (fails.length) {
   console.log("FAILED:");
   for (const f of fails) console.log("  -", f);
   process.exit(1);
 }
-const fails2 = [];
 console.log(`all checks passed — post structure verified line by line, ${heads.size} headers x ${descs.size} descriptions`);
 console.log("\nsample:\n" + out);
-
-// --- the publish hop is delegated, not done in the Worker ---
-const wsrc = readFileSync("./src/worker.js", "utf8");
-eq("worker does not call Binance directly (it is IP-blocked)", /content\/add/.test(wsrc), false);
-eq("worker dispatches to GitHub instead", /actions\/workflows\/\$\{WORKFLOW_FILE\}\/dispatches/.test(wsrc), true);
-eq("dispatch sends a User-Agent (GitHub rejects requests without one)", /"User-Agent": "whale-signals-worker"/.test(wsrc), true);
-eq("204 is treated as success", /res\.status === 204/.test(wsrc), true);

@@ -33,12 +33,17 @@ const CONFIG = {
 
 const SOURCES = [{ key: "whaletracker", channel: "WhaleTracker" }];
 
-// Pegged assets: a 12% target on a $1.00 coin is not a trade.
+// Excluded assets: pegged coins, fiat tokens, gold-backed (PAXG/XAUT) and PEPE,
+// all as requested. Symbols are matched uppercase against the parsed base.
 const STABLE_BASES = new Set([
-  "USDT", "USDC", "FDUSD", "TUSD", "USDP", "USDD", "DAI", "EURI", "EURT", "AEUR",
-  "PYUSD", "GUSD", "FRAX", "LUSD", "SUSD", "MUSD", "USDX", "CEUR", "XSGD", "TRYB", "BRLZ",
-  // kept from before
-  "RLUSD", "BUSD", "USDE", "USD1", "USDS", "CRVUSD", "USDG", "USDY", "EURS",
+  "USDT", "USDC", "BFUSD", "XUSD", "U", "FDUSD", "TUSD", "DAI", "USDP", "PYUSD", "USDD", "USDE",
+  "GUSD", "FRAX", "LUSD", "SUSD", "ALUSD", "USDTB", "EURT", "EURS", "BRL", "BRLZ", "BUSD",
+  "CADC", "NZDS", "TRYB", "GYEN", "JPYC", "XSGD", "EURL", "EURCV", "VEUR", "CNHT", "MIM",
+  "CRVUSD", "DOLA", "HUSD", "OUSD", "USDX", "USN", "VAI", "STBL", "CUSD", "DJED", "AGEUR",
+  "EEUR", "CEUR", "SEURO", "PAR", "MUSD", "EUSD", "TOR", "FEI", "USDV", "BOLD", "GRAI",
+  "PRISMA", "USH", "YUSD", "ZUSD", "USDS", "USD0", "HYUSD", "MIMA", "BRLA", "ARS", "TRYG",
+  "ZARV", "NGNV", "MXNT", "UAHC", "CNH", "IDRT", "PAXG", "XAUT", "PEPE", "RLUSD", "AEUR",
+  "EURI", "USD1", "USDG", "USDY"
 ]);
 
 const QUOTES = ["USDT", "USDC", "FDUSD", "TUSD", "BTC", "ETH", "BNB", "EUR", "TRY"];
@@ -668,27 +673,6 @@ export default {
     if (url.pathname === "/health")
       return json({ ok: true, sources: SOURCES.map((s) => s.channel), destination: CONFIG.postToBinanceSquare ? "binance-square" : "telegram" });
     if (url.pathname === "/state") return json((await env.STATE.get("state", { type: "json" })) || { channels: {} });
-    if (url.pathname === "/probe") {
-      // Diagnostic: can this Worker reach Binance at all? Uses the auth-only image
-      // endpoint so nothing is ever published.
-      const r = await fetch("https://www.binance.com/bapi/composite/v2/public/pgc/openApi/image/presignedUrl", {
-        method: "POST",
-        headers: {
-          "X-Square-OpenAPI-Key": env.BINANCE_SQUARE_KEY || "",
-          "Content-Type": "application/json",
-          clienttype: "binanceSkill",
-        },
-        body: JSON.stringify({ imageName: "probe.png" }),
-      });
-      const body = (await r.text()).slice(0, 300);
-      return json({
-        status: r.status,
-        colo: request.cf?.colo ?? null,
-        country: request.cf?.country ?? null,
-        cfRay: r.headers.get("cf-ray"),
-        body,
-      });
-    }
     if (url.pathname === "/dry") return json(await runOnce(env, { dryRun: true }));
     if (url.pathname === "/run") {
       if (env.ADMIN_KEY && url.searchParams.get("key") !== env.ADMIN_KEY) return json({ error: "bad key" }, 403);
