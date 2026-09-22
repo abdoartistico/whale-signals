@@ -19,7 +19,7 @@
 
 const CONFIG = {
   // Entry runs from slightly below the alert price UP TO the alert price.
-  entryZonePct: 0.4,
+  entryZonePct: 0.5,
   // Stop loss and targets are measured from the MIDPOINT of the entry range.
   stopLossPct: 7.0,
   takeProfitPcts: [4.0, 8.0, 12.0],
@@ -291,11 +291,12 @@ export function parsePumpDetector(text, msgId) {
  *   $KERNEL/USDT (30m) Overbought level reached
  *   Price: 0.0508 | RSI: 70.85 | Binance | TV
  *
- * Direction follows the standard mean-reversion reading of RSI:
- *   Overbought / Extreme Overbought -> SHORT   (stretched up, fade it)
- *   Oversold   / Extreme Oversold   -> LONG    (stretched down, buy it)
+ * Direction follows momentum continuation, not mean reversion:
+ *   Overbought / Extreme Overbought / Bullish crossover -> LONG
+ *   Oversold   / Extreme Oversold   / Bearish crossover -> SHORT
+ * (The channel runs ~74% overbought, so expect a mostly-LONG feed.)
  */
-const RE_CY_HEAD = /\$?([A-Z0-9]+)\/([A-Z]+)\s*\(([^)]+)\)\s*(Extreme\s+)?(Overbought|Oversold)\s+level reached/i;
+const RE_CY_HEAD = /\$?([A-Z0-9]+)\/([A-Z]+)\s*\(([^)]+)\)\s*(Extreme\s+)?(Overbought|Oversold|Bullish|Bearish)\b/i;
 const RE_CY_PRICE = /Price:\s*([\d.,]+)/;
 const RE_CY_RSI = /RSI:\s*([\d.,]+)/;
 const RE_CY_EXCH = /\|\s*([A-Za-z]+)\s*\|/;
@@ -325,10 +326,10 @@ export function parseCycloneRSI(text, msgId) {
   const ex = text.match(RE_CY_EXCH);
   sig.exchange = ex ? ex[1] : "";
 
-  // Overbought is a fade, oversold is a bounce.
-  const overbought = /Overbought/i.test(head[5]);
-  sig.side = overbought ? "sell" : "buy";
-  sig.direction = overbought ? "SHORT" : "LONG";
+  // Momentum continuation: strength begets strength, weakness begets weakness.
+  const bullish = /Overbought|Bullish/i.test(head[5]);
+  sig.side = bullish ? "buy" : "sell";
+  sig.direction = bullish ? "LONG" : "SHORT";
 
   // fields the shared setup/render path expects
   sig.alertVolume = 0;
@@ -362,9 +363,11 @@ export function buildSetup(sig, cfg) {
   const p = sig.price;
   const long = sig.side === "buy";
 
-  // Entry range: from slightly below the alert price up to the alert price itself.
-  const lo = p * (1 - cfg.entryZonePct / 100);
-  const hi = p;
+  // Entry range straddles the alert price in the direction of the trade:
+  //   LONG  -> price .. price * 1.005     SHORT -> price * 0.995 .. price
+  const z = cfg.entryZonePct / 100;
+  const lo = long ? p : p * (1 - z);
+  const hi = long ? p * (1 + z) : p;
   const mid = (lo + hi) / 2;
 
   // Stop and targets are both measured from the entry midpoint.
@@ -391,86 +394,26 @@ export function buildSetup(sig, cfg) {
 }
 // ---------------------------------------------------------------- post text
 //
-// One fixed structure, exactly as specified:
+// Fixed layout:
 //
-//   $SYMBOL — <header>
+//   $ASSET — LONG 🟢
 //
-//   Entry: <low> - <high>
-//   SL: <sl>
+//   <market description>
 //
-//   TP1: <t1>
-//   TP2: <t2>
-//   TP3: <t3>
+//   Entry: <min> – <max>
+//   SL: <value>
 //
-//   <short description>
+//   TP1: <value>
+//   TP2: <value>
+//   TP3: <value>
 //
-//   Trade here 👇
-//   $SYMBOL
+//   <call to action with emoji>
 //
-// The header and the description rotate. Descriptions also interpolate the real
-// order-flow numbers from the alert, so two posts about different coins never read
-// alike even when they draw the same phrasing.
-
-const LONG_HEADERS = [
-  "LONG setup big long now, big profit soon🤑",
-  "LONG setup momentum accelerating fast, massive gains incoming🚀",
-  "LONG setup breakout confirmed, ready to smash targets🔥",
-  "LONG setup buyers taking over, upside opening up💪",
-  "LONG setup demand surging, targets in sight🎯",
-  "LONG setup strong bid stepping in, move loading⚡",
-  "LONG setup volume exploding, rally starting🚀",
-  "LONG setup bulls in control, profit window open🤑",
-  "LONG setup accumulation done, expansion next📈",
-  "LONG setup pressure building fast, big candles coming🔥",
-  "LONG setup support holding firm, upside unlocked💎",
-  "LONG setup order flow flipping bullish, ride it📈",
-  "LONG setup dip bought hard, reversal confirmed💪",
-  "LONG setup buyers dominating the tape, targets ahead🎯",
-  "LONG setup momentum igniting, do not miss this🚀",
-  "LONG setup breakout in motion, profit soon🤑",
-  "LONG setup heavy buying detected, move starting⚡",
-  "LONG setup trend turning up, targets loading📈",
-  "LONG setup strength returning fast, upside ready🔥",
-  "LONG setup bids stacking up, squeeze potential💥",
-  "LONG setup fresh demand entering, rally forming🚀",
-  "LONG setup sellers exhausted, buyers stepping in💪",
-  "LONG setup clean entry forming, targets locked🎯",
-  "LONG setup big money buying, follow the flow💎",
-];
-
-const SHORT_HEADERS = [
-  "SHORT setup big drop now, big profit soon📉",
-  "SHORT setup breakdown confirmed, targets below🔻",
-  "SHORT setup sellers taking over, downside opening📉",
-  "SHORT setup supply flooding in, dump loading⚡",
-  "SHORT setup momentum turning down, profit soon💰",
-  "SHORT setup resistance rejected, fall incoming🔻",
-  "SHORT setup heavy selling detected, move starting📉",
-  "SHORT setup bears in control, targets ahead🎯",
-  "SHORT setup distribution done, breakdown next📉",
-  "SHORT setup pressure building down, red candles coming🔻",
-  "SHORT setup bounce sold hard, reversal confirmed📉",
-  "SHORT setup sellers dominating the tape, downside ready💰",
-  "SHORT setup trend turning down, targets loading🔻",
-  "SHORT setup weakness spreading fast, drop ready📉",
-  "SHORT setup asks stacking up, flush potential💥",
-  "SHORT setup fresh supply entering, dump forming🔻",
-  "SHORT setup buyers exhausted, sellers stepping in📉",
-  "SHORT setup clean short forming, targets locked🎯",
-  "SHORT setup big money selling, follow the flow💰",
-  "SHORT setup order flow flipping bearish, ride it🔻",
-  "SHORT setup support broken, downside unlocked📉",
-  "SHORT setup rally faded fast, short window open💰",
-  "SHORT setup volume exploding down, slide starting⚡",
-  "SHORT setup momentum collapsing, do not miss this🔻",
-];
-
-function money(v) {
-  for (const [div, tag] of [[1e9, "B"], [1e6, "M"], [1e3, "K"]]) {
-    if (Math.abs(v) >= div) return `$${(v / div).toFixed(2)}${tag}`;
-  }
-  return `$${Math.round(v).toLocaleString("en-US")}`;
-}
+//   $ASSET
+//
+// Two rotating slots -- the description and the CTA -- drawn independently by hash
+// of the message id. Several descriptions interpolate the alert's own RSI and
+// timeframe, so posts about different coins never read alike even on a repeat draw.
 
 function facts(s) {
   const g = s.signal;
@@ -478,107 +421,90 @@ function facts(s) {
     rsi: g.rsi == null ? "" : g.rsi.toFixed(2),
     tf: g.timeframe || "",
     exch: g.exchange || "Binance",
-    dom: `${Math.round(g.dominance)}%`,
-    vol: money(g.alertVolume),
-    vol24: money(g.vol24h),
-    window: g.window || "the last minute",
-    ch24: `${(g.change["24h"] ?? 0) > 0 ? "+" : ""}${(g.change["24h"] ?? 0).toFixed(2)}%`,
-    n15: g.netVol["15m"],
-    n1h: g.netVol["1h"],
-    alerts24: g.alerts24h,
   };
 }
 
 const LONG_DESCS = [
-  (f) => `Order book is leaning hard to the bid: ${f.dom} of ${f.vol} traded in ${f.window} was buying.`,
-  (f) => `Momentum check — ${f.vol} of demand in ${f.window} against ${f.vol24} daily turnover.`,
-  (f) => `Buyers absorbed the offers with ${f.dom} dominance, and the pair is ${f.ch24} on the day.`,
-  (f) => `Fresh bid stepping in: ${f.vol} bought in ${f.window} while net volume stays positive.`,
-  (f) => `Tape reads bullish — ${f.dom} buy-side pressure on ${f.vol24} of 24h volume.`,
-  (f) => `Accumulation showing up in the flow, ${f.vol} lifted in ${f.window} without much resistance.`,
-  (f) => `Liquidity is being taken on the ask side, ${f.dom} of the last burst was buying.`,
-  (f) => `Demand outpacing supply here: ${f.vol} in ${f.window}, day change ${f.ch24}.`,
-  (f) => `Volume profile is tilting up, with ${f.dom} of ${f.vol} hitting the offer.`,
-  (f) => `Buy-side aggression detected — ${f.vol} in ${f.window} on ${f.vol24} daily turnover.`,
-  (f) => `Order flow flipped: ${f.dom} buying pressure and this is alert ${f.alerts24} today.`,
-  (f) => `Strong bid defending the level, ${f.vol} absorbed in ${f.window}.`,
-  (f) => `Fundamentals aside, the tape is doing the talking: ${f.dom} of ${f.vol} was buying.`,
-  (f) => `Participation picking up fast, ${f.vol24} traded in 24h and the pair sits ${f.ch24}.`,
-  (f) => `Sellers stepping aside as ${f.vol} of demand cleared the book in ${f.window}.`,
-  (f) => `Buying interest concentrated here — ${f.dom} dominance and rising net volume.`,
-  (f) => `Real money on the bid: ${f.vol} in ${f.window}, well above the usual pace.`,
-  (f) => `Book is thin above and buyers are lifting it, ${f.dom} of the flow was aggressive.`,
-  (f) => `Bullish imbalance building, ${f.vol} bought against ${f.vol24} of daily volume.`,
-  (f) => `Repeat interest — ${f.alerts24} alerts today, latest ${f.vol} at ${f.dom} buy dominance.`,
+  (f) => `Momentum is expanding to the upside as buyers absorb every offer on the ${f.tf}.`,
+  (f) => `Order-flow has tilted decisively to the bid, with buy-side pressure building through the ${f.tf}.`,
+  (f) => `Liquidity above is thinning out while demand keeps stepping in — a classic continuation profile.`,
+  (f) => `Buyer pressure is dominating the tape, and ${f.tf} RSI at ${f.rsi} confirms momentum is live.`,
+  (f) => `Upside expansion in progress: resting supply is being cleared faster than it can be replaced.`,
+  (f) => `The bid is stacking aggressively and each pullback is getting bought before it develops.`,
+  (f) => `Strength is broadening out on the ${f.tf}, with order-flow favouring continuation over reversal.`,
+  (f) => `Momentum velocity is accelerating as liquidity shifts toward the buy side.`,
+  (f) => `Demand has taken control of this range and sellers are struggling to defend it.`,
+  (f) => `${f.tf} RSI printed ${f.rsi} — momentum is confirmed rather than exhausted at this stage.`,
+  (f) => `Buyers are lifting offers into thinning resistance, which tends to accelerate the move.`,
+  (f) => `Order book imbalance is firmly bullish, with depth drying up above current price.`,
+  (f) => `Trend expansion underway on ${f.exch}, supported by persistent buy-side flow.`,
+  (f) => `Every dip is being absorbed quickly — a sign of real demand rather than a short squeeze.`,
+  (f) => `Momentum has broken out of its recent compression and buyers are pressing the advantage.`,
+  (f) => `Liquidity is rotating into this pair, lifting price through prior supply with ease.`,
+  (f) => `Buy pressure is sustained rather than spiky, which favours follow-through on the ${f.tf}.`,
+  (f) => `Sellers have stepped back and the path of least resistance now points higher.`,
+  (f) => `Aggressive bidding is clearing the book, with ${f.tf} momentum firmly on the buy side.`,
+  (f) => `Upside velocity is building as participation increases and supply thins.`,
+  (f) => `Directional conviction is showing in the flow, with buyers controlling every retest.`,
+  (f) => `The ${f.tf} structure has shifted bullish and momentum is carrying price forward.`,
+  (f) => `Order-flow expansion favours longs while demand keeps outpacing available supply.`,
+  (f) => `Strong bid absorption at ${f.rsi} RSI on the ${f.tf} — momentum is intact, not fading.`,
 ];
 
 const SHORT_DESCS = [
-  (f) => `Order book is leaning hard to the ask: ${f.dom} of ${f.vol} traded in ${f.window} was selling.`,
-  (f) => `Momentum check — ${f.vol} of supply in ${f.window} against ${f.vol24} daily turnover.`,
-  (f) => `Sellers hit the bids with ${f.dom} dominance, and the pair is ${f.ch24} on the day.`,
-  (f) => `Fresh supply stepping in: ${f.vol} sold in ${f.window} while net volume stays negative.`,
-  (f) => `Tape reads bearish — ${f.dom} sell-side pressure on ${f.vol24} of 24h volume.`,
-  (f) => `Distribution showing up in the flow, ${f.vol} dumped in ${f.window} with weak bids.`,
-  (f) => `Liquidity is being taken on the bid side, ${f.dom} of the last burst was selling.`,
-  (f) => `Supply outpacing demand here: ${f.vol} in ${f.window}, day change ${f.ch24}.`,
-  (f) => `Volume profile is tilting down, with ${f.dom} of ${f.vol} hitting the bid.`,
-  (f) => `Sell-side aggression detected — ${f.vol} in ${f.window} on ${f.vol24} daily turnover.`,
-  (f) => `Order flow flipped: ${f.dom} selling pressure and this is alert ${f.alerts24} today.`,
-  (f) => `Bids getting pulled as ${f.vol} of supply cleared the book in ${f.window}.`,
-  (f) => `Fundamentals aside, the tape is doing the talking: ${f.dom} of ${f.vol} was selling.`,
-  (f) => `Participation picking up fast, ${f.vol24} traded in 24h and the pair sits ${f.ch24}.`,
-  (f) => `Buyers stepping aside while ${f.vol} of supply pressured the book in ${f.window}.`,
-  (f) => `Selling interest concentrated here — ${f.dom} dominance and falling net volume.`,
-  (f) => `Real size on the offer: ${f.vol} in ${f.window}, well above the usual pace.`,
-  (f) => `Book is thin below and sellers are pressing it, ${f.dom} of the flow was aggressive.`,
-  (f) => `Bearish imbalance building, ${f.vol} sold against ${f.vol24} of daily volume.`,
-  (f) => `Persistent supply — ${f.alerts24} alerts today, latest ${f.vol} at ${f.dom} sell dominance.`,
+  (f) => `Breakdown velocity is picking up as sellers hit every bid on the ${f.tf}.`,
+  (f) => `Order-flow has rolled over to the offer, with sell-side pressure compounding.`,
+  (f) => `Liquidity below is thin and supply keeps stepping in — continuation lower is favoured.`,
+  (f) => `Seller pressure is dominating the tape, and ${f.tf} RSI at ${f.rsi} confirms weakness is live.`,
+  (f) => `Downside expansion in progress: resting bids are being cleared faster than they refill.`,
+  (f) => `The offer is stacking aggressively and every bounce is being sold into.`,
+  (f) => `Weakness is broadening out on the ${f.tf}, with order-flow favouring continuation lower.`,
+  (f) => `Breakdown velocity is accelerating as liquidity shifts toward the sell side.`,
+  (f) => `Supply has taken control of this range and buyers are failing to defend it.`,
+  (f) => `${f.tf} RSI printed ${f.rsi} — weakness is confirmed rather than washed out at this stage.`,
+  (f) => `Sellers are hitting bids into thinning support, which tends to accelerate the decline.`,
+  (f) => `Order book imbalance is firmly bearish, with depth drying up beneath current price.`,
+  (f) => `Trend breakdown underway on ${f.exch}, supported by persistent sell-side flow.`,
+  (f) => `Every bounce is being distributed into — a sign of real supply rather than a flush.`,
+  (f) => `Momentum has broken down out of compression and sellers are pressing the advantage.`,
+  (f) => `Liquidity is rotating out of this pair, dragging price through prior support.`,
+  (f) => `Sell pressure is sustained rather than spiky, which favours follow-through on the ${f.tf}.`,
+  (f) => `Buyers have stepped back and the path of least resistance now points lower.`,
+  (f) => `Aggressive offering is clearing the book, with ${f.tf} momentum firmly on the sell side.`,
+  (f) => `Downside velocity is building as participation increases and bids thin out.`,
+  (f) => `Directional conviction is showing in the flow, with sellers controlling every retest.`,
+  (f) => `The ${f.tf} structure has shifted bearish and momentum is carrying price down.`,
+  (f) => `Order-flow contraction favours shorts while supply keeps outpacing available demand.`,
+  (f) => `Heavy offer absorption at ${f.rsi} RSI on the ${f.tf} — weakness is intact, not fading.`,
 ];
 
-// CycloneRSI publishes an RSI reading and a timeframe -- and no order-flow data --
-// so it gets its own descriptions. Claiming volume dominance here would be invented.
-const RSI_SHORT_DESCS = [
-  (f) => `RSI pushed to ${f.rsi} on the ${f.tf} chart, stretched into overbought territory where pullbacks usually begin.`,
-  (f) => `Momentum is overextended: ${f.tf} RSI at ${f.rsi}. Buyers are running thin up here.`,
-  (f) => `Overbought on the ${f.tf} with RSI ${f.rsi} — the kind of reading that tends to cool off before it continues.`,
-  (f) => `${f.tf} RSI at ${f.rsi}. Price has run hot and mean reversion is the higher-probability path.`,
-  (f) => `Stretched to the upside — RSI ${f.rsi} on the ${f.tf}. Watching for the fade back toward balance.`,
-  (f) => `${f.tf} RSI printed ${f.rsi}, deep in overbought. Late buyers are usually the ones who pay for this.`,
-  (f) => `Overbought signal on ${f.exch}: ${f.tf} RSI ${f.rsi}. Risk is skewed to the downside from here.`,
-  (f) => `RSI ${f.rsi} on the ${f.tf} — momentum this extended rarely holds without a pause.`,
-  (f) => `The ${f.tf} chart is overbought at RSI ${f.rsi}. A rotation lower would relieve the pressure.`,
-  (f) => `Heat check: ${f.tf} RSI ${f.rsi}. Overbought readings like this often mark short-term tops.`,
-  (f) => `${f.tf} RSI at ${f.rsi} and rising. The move is mature, not early.`,
-  (f) => `Overbought exhaustion showing on the ${f.tf}, RSI ${f.rsi}. Fading strength here.`,
-  (f) => `RSI ${f.rsi} — the ${f.tf} is priced for perfection and vulnerable to a snap back.`,
-  (f) => `Extended rally, ${f.tf} RSI ${f.rsi}. Taking the other side while momentum is stretched.`,
-  (f) => `${f.exch} ${f.tf}: RSI ${f.rsi}. Overbought conditions favour sellers over the next legs.`,
-  (f) => `Upside momentum is peaking — RSI ${f.rsi} on the ${f.tf}. Reversion trade setting up.`,
-];
-
-const RSI_LONG_DESCS = [
-  (f) => `RSI dropped to ${f.rsi} on the ${f.tf} chart, deep in oversold territory where bounces tend to form.`,
-  (f) => `Selling looks exhausted: ${f.tf} RSI at ${f.rsi}. Downside momentum is running out.`,
-  (f) => `Oversold on the ${f.tf} with RSI ${f.rsi} — readings this low rarely persist for long.`,
-  (f) => `${f.tf} RSI at ${f.rsi}. Price has been pushed too far down and mean reversion favours a bounce.`,
-  (f) => `Stretched to the downside — RSI ${f.rsi} on the ${f.tf}. Watching for the recovery back toward balance.`,
-  (f) => `${f.tf} RSI printed ${f.rsi}, deep in oversold. Capitulation often marks the turn.`,
-  (f) => `Oversold signal on ${f.exch}: ${f.tf} RSI ${f.rsi}. Risk is skewed to the upside from here.`,
-  (f) => `RSI ${f.rsi} on the ${f.tf} — sellers have done most of the damage already.`,
-  (f) => `The ${f.tf} chart is oversold at RSI ${f.rsi}. A relief move would be the natural reaction.`,
-  (f) => `Washout check: ${f.tf} RSI ${f.rsi}. Oversold readings like this often mark short-term bottoms.`,
-  (f) => `${f.tf} RSI at ${f.rsi} and falling. The flush is late-stage, not early.`,
-  (f) => `Oversold exhaustion showing on the ${f.tf}, RSI ${f.rsi}. Buying weakness here.`,
-  (f) => `RSI ${f.rsi} — the ${f.tf} is priced for disaster and due a snap back.`,
-  (f) => `Extended flush, ${f.tf} RSI ${f.rsi}. Taking the other side while momentum is stretched.`,
-  (f) => `${f.exch} ${f.tf}: RSI ${f.rsi}. Oversold conditions favour buyers over the next legs.`,
-  (f) => `Downside momentum is bottoming — RSI ${f.rsi} on the ${f.tf}. Reversion trade setting up.`,
+const CTAS = [
+  "Position early and manage your risk 🚀",
+  "Set your orders and let the move work 📈",
+  "Watch the entry zone and act decisively ⚡",
+  "Scale in carefully and respect the stop 🎯",
+  "Get positioned before the expansion 🔥",
+  "Plan the trade, then trade the plan 💡",
+  "Size it properly and stay disciplined 🛡️",
+  "Track the levels and stay patient ⏱️",
+  "Follow the flow and protect your downside 💎",
+  "Enter on your terms, not the market's 🧠",
+  "Keep the stop tight and let winners run 🏁",
+  "Take the setup and manage it actively 📊",
+  "Stay sharp — the levels do the work ✅",
+  "Trade it clean and bank the targets 💰",
+  "Execute with a plan, not emotion 🧭",
+  "Mark the levels and wait for your fill 📌",
+  "Respect the invalidation and stay nimble 🔑",
+  "Let the setup come to you 🕐",
+  "Manage risk first, profits follow 📗",
+  "Stay selective and let this one develop 🌊",
 ];
 
 /**
  * Integer hash so each rotating slot is drawn independently.
  * A linear stride (seed * salt) makes the slots move in lockstep, which collapses the
- * variety to the pool length; hashing keeps header and description uncorrelated.
+ * variety to the pool length; hashing keeps description and CTA uncorrelated.
  */
 function hash32(x) {
   x = (x ^ 61) ^ (x >>> 16);
@@ -593,27 +519,25 @@ const pick = (pool, seed, salt) => pool[hash32(Math.imul(seed, 0x9e3779b1) + Mat
 
 export function render(s, seed) {
   const long = s.direction === "LONG";
-  const header = pick(long ? LONG_HEADERS : SHORT_HEADERS, seed, 1);
-  const rsiSource = s.signal.source === "cyclonersi";
-  const pool = rsiSource
-    ? (long ? RSI_LONG_DESCS : RSI_SHORT_DESCS)
-    : (long ? LONG_DESCS : SHORT_DESCS);
-  const desc = pick(pool, seed, 7)(facts(s));
+  const desc = pick(long ? LONG_DESCS : SHORT_DESCS, seed, 7)(facts(s));
+  const cta = pick(CTAS, seed, 13);
 
-  return `${s.ticker} — ${header}
+  return `${s.ticker} — ${s.direction} ${long ? "🟢" : "🔴"}
 
-Entry: ${s.entryLow} - ${s.entryHigh}
+${desc}
+
+Entry: ${s.entryLow} – ${s.entryHigh}
 SL: ${s.stop}
 
 TP1: ${s.targets[0]}
 TP2: ${s.targets[1]}
 TP3: ${s.targets[2]}
 
-${desc}
+${cta}
 
-Trade here 👇
 ${s.ticker}`;
 }
+
 // ---------------------------------------------------------------- publishing
 //
 // Binance blocks Cloudflare Workers' egress IPs: this Worker gets a plain nginx 403
@@ -752,6 +676,7 @@ async function runOnce(env, { dryRun = false, force = false } = {}) {
   }
 
   // --- hand one signal to each account that is due ---
+  if (!eligible.length) log.push("no new eligible signals this tick");
   const accounts = {};
   for (const acct of ACCOUNTS) {
     const a = accountState(state, acct.key, nowMs);
