@@ -1,14 +1,18 @@
 /**
- * WhaleTracker -> Binance Square, on Cloudflare Workers.
+ * CycloneRSI -> Binance Square, on Cloudflare Workers.
  *
- * Reads the public WhaleTracker Telegram channel, turns each volume alert into a
- * trade setup, and publishes it to Binance Square via the Square OpenAPI.
- * Runs on a Cron Trigger every 2 minutes. State lives in Workers KV.
+ * Reads the public CycloneRSI Telegram channel (RSI overbought/oversold alerts, each
+ * with a chart image), turns each into a trade setup, and publishes it to Binance
+ * Square with the chart attached. Cron every 2 minutes; state in Workers KV.
  *
- * Binance Square allows 100 posts/day. WhaleTracker produces ~570 alerts/day, so
- * posting is paced: at most one post per MIN_MINUTES_BETWEEN_POSTS, hard-capped by
- * maxPostsPerDay, always choosing the NEWEST eligible signal in the window. Pacing
- * (rather than posting until the quota dies) keeps coverage spread over 24h.
+ * Direction follows the standard mean-reversion reading of RSI:
+ *   Overbought -> SHORT, Oversold -> LONG.
+ * Note the channel is heavily skewed to overbought, so most posts are shorts.
+ *
+ * Binance Square allows 100 posts/day and 400 uploads/day; the channel produces
+ * ~870 alerts/day. Posting is therefore paced at one per minMinutesBetweenPosts,
+ * hard-capped by maxPostsPerDay, always taking the NEWEST eligible signal in the
+ * window so coverage stays spread across 24h instead of dying by breakfast.
  *
  * Cloudflare free-plan budget per invocation: 50 subrequests, 10ms CPU.
  */
@@ -31,7 +35,8 @@ const CONFIG = {
   // Telegram receives a confirmation with the Binance post link from that Action.
 };
 
-const SOURCES = [{ key: "whaletracker", channel: "WhaleTracker" }];
+// WhaleTracker and the pump channel are kept and still parsed by tests, but dormant.
+const SOURCES = [{ key: "cyclonersi", channel: "CycloneRSI" }];
 
 // Excluded assets: pegged coins, fiat tokens, gold-backed (PAXG/XAUT) and PEPE,
 // all as requested. Symbols are matched uppercase against the parsed base.
@@ -89,32 +94,36 @@ function stripHtml(fragment) {
 }
 
 /**
- * Pull (id, text) pairs out of the public web preview.
- * Uses indexOf/slice rather than one big regex over ~100KB of HTML, to stay
- * comfortably inside the 10ms CPU budget.
+ * Pull [id, text, imageUrl] triples out of the public web preview.
+ *
+ * Splits on the per-message marker so a photo can never be paired with the wrong
+ * message, and matches the photo wrapper specifically -- a bare background-image
+ * regex also picks up author avatars.
  */
 export function extractPosts(html) {
   const out = [];
-  const ID_MARK = 'data-post="';
-  const TEXT_MARK = 'js-message_text"';
-  let cursor = 0;
-  for (;;) {
-    const idAt = html.indexOf(ID_MARK, cursor);
-    if (idAt === -1) break;
-    const idEnd = html.indexOf('"', idAt + ID_MARK.length);
-    const post = html.slice(idAt + ID_MARK.length, idEnd); // "Channel/12345"
-    const slash = post.lastIndexOf("/");
-    const id = parseInt(post.slice(slash + 1), 10);
+  const parts = html.split('data-post="');
+  for (let i = 1; i < parts.length; i++) {
+    const p = parts[i];
+    const id = parseInt(p.slice(0, p.indexOf('"')).split("/").pop(), 10);
+    if (!id) continue;
 
-    const textAt = html.indexOf(TEXT_MARK, idEnd);
-    if (textAt === -1) break;
-    const open = html.indexOf(">", textAt);
-    // next message's id marker bounds this one's body
-    const nextId = html.indexOf(ID_MARK, open);
-    const body = html.slice(open + 1, nextId === -1 ? html.length : nextId);
-    const close = body.indexOf("</div>");
-    if (id) out.push([id, stripHtml(close === -1 ? body : body.slice(0, close))]);
-    cursor = nextId === -1 ? html.length : nextId;
+    let text = "";
+    const tAt = p.indexOf("js-message_text");
+    if (tAt !== -1) {
+      const open = p.indexOf(">", tAt);
+      const close = p.indexOf("</div>", open);
+      text = stripHtml(p.slice(open + 1, close === -1 ? undefined : close));
+    }
+
+    let image = null;
+    const wAt = p.indexOf("tgme_widget_message_photo_wrap");
+    if (wAt !== -1) {
+      const m = /background-image:url\('([^']+)'\)/.exec(p.slice(wAt, wAt + 800));
+      if (m) image = m[1];
+    }
+
+    out.push([id, text, image]);
     if (out.length > 120) break;
   }
   return out;
@@ -263,7 +272,64 @@ export function parsePumpDetector(text, msgId) {
   return sig;
 }
 
-export const PARSERS = { whaletracker: parseMessage, pumpdetector: parsePumpDetector };
+/**
+ * CycloneRSI format (every post carries a chart image):
+ *
+ *   $KERNEL/USDT (30m) Overbought level reached
+ *   Price: 0.0508 | RSI: 70.85 | Binance | TV
+ *
+ * Direction follows the standard mean-reversion reading of RSI:
+ *   Overbought / Extreme Overbought -> SHORT   (stretched up, fade it)
+ *   Oversold   / Extreme Oversold   -> LONG    (stretched down, buy it)
+ */
+const RE_CY_HEAD = /\$?([A-Z0-9]+)\/([A-Z]+)\s*\(([^)]+)\)\s*(Extreme\s+)?(Overbought|Oversold)\s+level reached/i;
+const RE_CY_PRICE = /Price:\s*([\d.,]+)/;
+const RE_CY_RSI = /RSI:\s*([\d.,]+)/;
+const RE_CY_EXCH = /\|\s*([A-Za-z]+)\s*\|/;
+
+export function parseCycloneRSI(text, msgId) {
+  const head = text.match(RE_CY_HEAD);
+  if (!head) return null;
+  const price = text.match(RE_CY_PRICE);
+  if (!price) return null;
+
+  const sig = {
+    msgId,
+    source: "cyclonersi",
+    base: head[1].toUpperCase(),
+    quote: head[2].toUpperCase(),
+    timeframe: head[3].trim(),
+    extreme: Boolean(head[4]),
+    condition: (head[4] ? "Extreme " : "") + head[5],
+  };
+  sig.symbol = sig.base + sig.quote;
+  sig.priceRaw = price[1].replace(/,/g, "");
+  sig.price = toNumber(price[1]) || 0;
+  if (sig.price <= 0) return null;
+
+  const rsi = text.match(RE_CY_RSI);
+  sig.rsi = rsi ? toNumber(rsi[1]) : null;
+  const ex = text.match(RE_CY_EXCH);
+  sig.exchange = ex ? ex[1] : "";
+
+  // Overbought is a fade, oversold is a bounce.
+  const overbought = /Overbought/i.test(head[5]);
+  sig.side = overbought ? "sell" : "buy";
+  sig.direction = overbought ? "SHORT" : "LONG";
+
+  // fields the shared setup/render path expects
+  sig.alertVolume = 0;
+  sig.window = sig.timeframe;
+  sig.change = {};
+  sig.netVol = {};
+  sig.vol24h = 0;
+  sig.alerts24h = 0;
+  sig.alerts4h = 0;
+  sig.dominance = 0;
+  return sig;
+}
+
+export const PARSERS = { whaletracker: parseMessage, pumpdetector: parsePumpDetector, cyclonersi: parseCycloneRSI };
 
 // ---------------------------------------------------------------- levels
 
@@ -396,6 +462,9 @@ function money(v) {
 function facts(s) {
   const g = s.signal;
   return {
+    rsi: g.rsi == null ? "" : g.rsi.toFixed(2),
+    tf: g.timeframe || "",
+    exch: g.exchange || "Binance",
     dom: `${Math.round(g.dominance)}%`,
     vol: money(g.alertVolume),
     vol24: money(g.vol24h),
@@ -453,6 +522,46 @@ const SHORT_DESCS = [
   (f) => `Persistent supply — ${f.alerts24} alerts today, latest ${f.vol} at ${f.dom} sell dominance.`,
 ];
 
+// CycloneRSI publishes an RSI reading and a timeframe -- and no order-flow data --
+// so it gets its own descriptions. Claiming volume dominance here would be invented.
+const RSI_SHORT_DESCS = [
+  (f) => `RSI pushed to ${f.rsi} on the ${f.tf} chart, stretched into overbought territory where pullbacks usually begin.`,
+  (f) => `Momentum is overextended: ${f.tf} RSI at ${f.rsi}. Buyers are running thin up here.`,
+  (f) => `Overbought on the ${f.tf} with RSI ${f.rsi} — the kind of reading that tends to cool off before it continues.`,
+  (f) => `${f.tf} RSI at ${f.rsi}. Price has run hot and mean reversion is the higher-probability path.`,
+  (f) => `Stretched to the upside — RSI ${f.rsi} on the ${f.tf}. Watching for the fade back toward balance.`,
+  (f) => `${f.tf} RSI printed ${f.rsi}, deep in overbought. Late buyers are usually the ones who pay for this.`,
+  (f) => `Overbought signal on ${f.exch}: ${f.tf} RSI ${f.rsi}. Risk is skewed to the downside from here.`,
+  (f) => `RSI ${f.rsi} on the ${f.tf} — momentum this extended rarely holds without a pause.`,
+  (f) => `The ${f.tf} chart is overbought at RSI ${f.rsi}. A rotation lower would relieve the pressure.`,
+  (f) => `Heat check: ${f.tf} RSI ${f.rsi}. Overbought readings like this often mark short-term tops.`,
+  (f) => `${f.tf} RSI at ${f.rsi} and rising. The move is mature, not early.`,
+  (f) => `Overbought exhaustion showing on the ${f.tf}, RSI ${f.rsi}. Fading strength here.`,
+  (f) => `RSI ${f.rsi} — the ${f.tf} is priced for perfection and vulnerable to a snap back.`,
+  (f) => `Extended rally, ${f.tf} RSI ${f.rsi}. Taking the other side while momentum is stretched.`,
+  (f) => `${f.exch} ${f.tf}: RSI ${f.rsi}. Overbought conditions favour sellers over the next legs.`,
+  (f) => `Upside momentum is peaking — RSI ${f.rsi} on the ${f.tf}. Reversion trade setting up.`,
+];
+
+const RSI_LONG_DESCS = [
+  (f) => `RSI dropped to ${f.rsi} on the ${f.tf} chart, deep in oversold territory where bounces tend to form.`,
+  (f) => `Selling looks exhausted: ${f.tf} RSI at ${f.rsi}. Downside momentum is running out.`,
+  (f) => `Oversold on the ${f.tf} with RSI ${f.rsi} — readings this low rarely persist for long.`,
+  (f) => `${f.tf} RSI at ${f.rsi}. Price has been pushed too far down and mean reversion favours a bounce.`,
+  (f) => `Stretched to the downside — RSI ${f.rsi} on the ${f.tf}. Watching for the recovery back toward balance.`,
+  (f) => `${f.tf} RSI printed ${f.rsi}, deep in oversold. Capitulation often marks the turn.`,
+  (f) => `Oversold signal on ${f.exch}: ${f.tf} RSI ${f.rsi}. Risk is skewed to the upside from here.`,
+  (f) => `RSI ${f.rsi} on the ${f.tf} — sellers have done most of the damage already.`,
+  (f) => `The ${f.tf} chart is oversold at RSI ${f.rsi}. A relief move would be the natural reaction.`,
+  (f) => `Washout check: ${f.tf} RSI ${f.rsi}. Oversold readings like this often mark short-term bottoms.`,
+  (f) => `${f.tf} RSI at ${f.rsi} and falling. The flush is late-stage, not early.`,
+  (f) => `Oversold exhaustion showing on the ${f.tf}, RSI ${f.rsi}. Buying weakness here.`,
+  (f) => `RSI ${f.rsi} — the ${f.tf} is priced for disaster and due a snap back.`,
+  (f) => `Extended flush, ${f.tf} RSI ${f.rsi}. Taking the other side while momentum is stretched.`,
+  (f) => `${f.exch} ${f.tf}: RSI ${f.rsi}. Oversold conditions favour buyers over the next legs.`,
+  (f) => `Downside momentum is bottoming — RSI ${f.rsi} on the ${f.tf}. Reversion trade setting up.`,
+];
+
 /**
  * Integer hash so each rotating slot is drawn independently.
  * A linear stride (seed * salt) makes the slots move in lockstep, which collapses the
@@ -472,7 +581,11 @@ const pick = (pool, seed, salt) => pool[hash32(Math.imul(seed, 0x9e3779b1) + Mat
 export function render(s, seed) {
   const long = s.direction === "LONG";
   const header = pick(long ? LONG_HEADERS : SHORT_HEADERS, seed, 1);
-  const desc = pick(long ? LONG_DESCS : SHORT_DESCS, seed, 7)(facts(s));
+  const rsiSource = s.signal.source === "cyclonersi";
+  const pool = rsiSource
+    ? (long ? RSI_LONG_DESCS : RSI_SHORT_DESCS)
+    : (long ? LONG_DESCS : SHORT_DESCS);
+  const desc = pick(pool, seed, 7)(facts(s));
 
   return `${s.ticker} — ${header}
 
@@ -502,7 +615,7 @@ const WORKFLOW_FILE = "publish-square.yml";
  * Trigger the GitHub workflow that publishes to Binance Square.
  * Returns 204 with no body on success.
  */
-export async function dispatchPublish(env, text, meta) {
+export async function dispatchPublish(env, text, meta, image) {
   const repo = env.GITHUB_REPO || "abdoartistico/whale-signals";
   const token = env.GITHUB_TOKEN || "";
   if (!token) return { ok: false, error: "GITHUB_TOKEN is not set" };
@@ -520,7 +633,7 @@ export async function dispatchPublish(env, text, meta) {
       },
       body: JSON.stringify({
         ref: env.GITHUB_REF || "main",
-        inputs: { text, meta: JSON.stringify(meta) },
+        inputs: { text, meta: JSON.stringify(meta), image: image || "" },
       }),
     });
   } catch (err) {
@@ -584,13 +697,13 @@ async function runOnce(env, { dryRun = false, force = false } = {}) {
 
     // Everything that survives the coin filter, newest last.
     const eligible = [];
-    for (const [id, text] of fresh) {
+    for (const [id, text, image] of fresh) {
       const sig = PARSERS[src.key](text, id);
       if (!sig) continue;
       if (CONFIG.usdtPairsOnly && !STABLE_QUOTES.has(sig.quote)) continue;
       if (CONFIG.excludeStablecoins && STABLE_BASES.has(sig.base)) continue;
       if (!CONFIG.allowShorts && sig.side === "sell") continue;
-      eligible.push(sig);
+      eligible.push({ sig, image });
     }
 
     perSource[src.key] = { fetched: posts.length, fresh: fresh.length, eligible: eligible.length, lastId: highest };
@@ -607,14 +720,15 @@ async function runOnce(env, { dryRun = false, force = false } = {}) {
     } else if (sinceLastMin < CONFIG.minMinutesBetweenPosts && !force) {
       log.push(`pacing: ${(CONFIG.minMinutesBetweenPosts - sinceLastMin).toFixed(1)} min until next post`);
     } else {
-      const sig = eligible[eligible.length - 1]; // newest is the most tradable
+      const { sig, image } = eligible[eligible.length - 1]; // newest is the most tradable
       const s = buildSetup(sig, CONFIG);
       const text = render(s, sig.msgId);
 
       if (dryRun) {
-        log.push(`[dry] ${sig.symbol} ${s.direction} (${eligible.length} eligible, posting newest)\n${text}`);
+        log.push(`[dry] ${sig.symbol} ${s.direction} (${eligible.length} eligible, posting newest)\nimage: ${image || "none"}\n${text}`);
       } else {
         const meta = {
+          image: image || "",
           ticker: s.ticker,
           direction: s.direction,
           entry: `${s.entryLow} - ${s.entryHigh}`,
@@ -623,14 +737,14 @@ async function runOnce(env, { dryRun = false, force = false } = {}) {
           used: state.quota.count + 1,
           cap: CONFIG.maxPostsPerDay,
         };
-        const r = await dispatchPublish(env, text, meta);
+        const r = await dispatchPublish(env, text, meta, image);
         if (!r.ok) {
           log.push(`dispatch FAILED ${sig.symbol}: ${r.error}`);
         } else {
           // Dispatch accepted. The Action performs the Binance post and sends the
           // Telegram confirmation with the link. Counting here (rather than on the
           // Action's result) can only ever under-post, never breach the daily cap.
-          log.push(`dispatched ${sig.symbol} ${s.direction} to GitHub for publishing`);
+          log.push(`dispatched ${sig.symbol} ${s.direction}${image ? " +image" : " (no image)"} to GitHub for publishing`);
           state.quota.count += 1;
           state.quota.lastPostMs = nowMs;
           state.sentTotal = (state.sentTotal || 0) + 1;

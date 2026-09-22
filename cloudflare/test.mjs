@@ -1,6 +1,6 @@
 /** Offline checks. Run: node test.mjs */
 
-import { parseMessage, parsePumpDetector, buildSetup, render, extractPosts } from "./src/worker.js";
+import { parseMessage, parsePumpDetector, parseCycloneRSI, buildSetup, render, extractPosts } from "./src/worker.js";
 
 const CFG = { entryZonePct: 0.4, stopLossPct: 7.0, takeProfitPcts: [4.0, 8.0, 12.0] };
 const fails = [];
@@ -128,6 +128,63 @@ eq("worker has no binance.com request URL", /["\x60]https:\/\/www\.binance\.com/
 eq("worker dispatches to GitHub instead", /actions\/workflows\/\$\{WORKFLOW_FILE\}\/dispatches/.test(wsrc), true);
 eq("dispatch sends a User-Agent (GitHub rejects requests without one)", /"User-Agent": "whale-signals-worker"/.test(wsrc), true);
 eq("204 is treated as success", /res\.status === 204/.test(wsrc), true);
+
+// --- CycloneRSI: the active source ---
+const CY_OB = "$KERNEL/USDT (30m) Overbought level reached\nPrice: 0.0508 | RSI: 70.85 | Binance | TV";
+const CY_OS = "$DOGE/USDT (4h) Extreme Oversold level reached\nPrice: 0.1234 | RSI: 18.40 | Binance | TV";
+
+const ob = parseCycloneRSI(CY_OB, 500);
+eq("cyclone base", ob.base, "KERNEL");
+eq("cyclone quote", ob.quote, "USDT");
+eq("cyclone timeframe", ob.timeframe, "30m");
+eq("cyclone price", ob.price, 0.0508);
+eq("cyclone rsi", ob.rsi, 70.85);
+eq("cyclone exchange", ob.exchange, "Binance");
+eq("cyclone source tag", ob.source, "cyclonersi");
+// RSI mean reversion: overbought fades, oversold bounces
+eq("overbought -> SHORT", ob.direction, "SHORT");
+eq("overbought side", ob.side, "sell");
+
+const os_ = parseCycloneRSI(CY_OS, 501);
+eq("oversold -> LONG", os_.direction, "LONG");
+eq("extreme flag", os_.extreme, true);
+eq("extreme condition text", os_.condition, "Extreme Oversold");
+eq("cyclone rsi low", os_.rsi, 18.4);
+
+eq("non-cyclone text -> null", parseCycloneRSI("hello world", 502), null);
+eq("whaletracker msg not parsed as cyclone", parseCycloneRSI(AAVE, 503), null);
+
+// levels still behave for a SHORT
+const cs = buildSetup(ob, CFG);
+eq("cyclone ticker", cs.ticker, "$KERNEL");
+eq("short stop above price", Number(cs.stop) > ob.price, true);
+
+// descriptions must use RSI, never invented order-flow figures
+const cyOut = render(cs, 500);
+eq("uses the RSI reading", cyOut.includes("70.85"), true);
+eq("no invented volume", /\$0\b|\$NaN|dominance/.test(cyOut), false);
+const cyDescs = new Set();
+for (let seed = 0; seed < 80; seed++) cyDescs.add(render(cs, seed).split("\n")[9]);
+eq("RSI descriptions rotate", cyDescs.size >= 10, true);
+
+// --- image extraction pairs the photo with its own message ---
+const HTML = `<div data-post="CycloneRSI/1"><a class="tgme_widget_message_photo_wrap" style="background-image:url('https://cdn5.telesco.pe/file/AAA')"></a>` +
+  `<div class="tgme_widget_message_text js-message_text">$KERNEL/USDT (30m) Overbought level reached<br/>Price: 0.0508 | RSI: 70.85 | Binance | TV</div></div>` +
+  `<div data-post="CycloneRSI/2"><a class="tgme_widget_message_photo_wrap" style="background-image:url('https://cdn5.telesco.pe/file/BBB')"></a>` +
+  `<div class="tgme_widget_message_text js-message_text">$DOGE/USDT (4h) Oversold level reached<br/>Price: 0.1234 | RSI: 25.00 | Binance | TV</div></div>`;
+const ex = extractPosts(HTML);
+eq("two posts extracted", ex.length, 2);
+eq("post 1 image", ex[0][2], "https://cdn5.telesco.pe/file/AAA");
+eq("post 2 image", ex[1][2], "https://cdn5.telesco.pe/file/BBB");
+eq("post 1 text parses", parseCycloneRSI(ex[0][1], ex[0][0]).base, "KERNEL");
+eq("post 2 text parses", parseCycloneRSI(ex[1][1], ex[1][0]).base, "DOGE");
+// an avatar background-image must not be mistaken for the chart
+const NOPIC = `<div data-post="c/3"><i class="tgme_widget_message_user_photo" style="background-image:url('https://cdn.telesco.pe/avatar')"></i>` +
+  `<div class="tgme_widget_message_text js-message_text">no photo here</div></div>`;
+eq("avatar is not treated as a chart", extractPosts(NOPIC)[0][2], null);
+
+// --- the image must reach the publisher ---
+eq("dispatch sends the image input", /inputs: \{ text, meta: JSON\.stringify\(meta\), image/.test(wsrc), true);
 
 if (fails.length) {
   console.log("FAILED:");

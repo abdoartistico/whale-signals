@@ -19,6 +19,11 @@ on:
         required: false
         default: "{}"
         type: string
+      image:
+        description: "URL of the chart image to attach (optional)"
+        required: false
+        default: ""
+        type: string
 
 permissions: {}
 
@@ -37,9 +42,10 @@ jobs:
           TG_CHATS: ${{ secrets.TELEGRAM_CHAT_ID }}
           POST_TEXT: ${{ inputs.text }}
           POST_META: ${{ inputs.meta }}
+          POST_IMAGE: ${{ inputs.image }}
         run: |
           python3 - <<'PY'
-          import json, os, urllib.request, urllib.error, sys
+          import json, os, time, urllib.request, urllib.error, sys
 
           text = os.environ["POST_TEXT"]
           meta = json.loads(os.environ.get("POST_META") or "{}")
@@ -54,12 +60,64 @@ jobs:
               except urllib.error.HTTPError as e:
                   return e.code, e.read().decode("utf-8", "replace")
 
+          V2 = "https://www.binance.com/bapi/composite/v2/public/pgc/openApi"
+          HDR = {"X-Square-OpenAPI-Key": key, "Content-Type": "application/json",
+                 "clienttype": "binanceSkill"}
+
+          def api(path, payload):
+              st, raw = http(V2 + path, payload, HDR)
+              try:
+                  j = json.loads(raw)
+              except ValueError:
+                  raise RuntimeError(f"non-JSON {st} from {path}: {raw[:200]}")
+              if j.get("code") != "000000":
+                  raise RuntimeError(f"[{j.get('code')}] {j.get('message')} from {path}")
+              return j.get("data") or {}
+
+          def upload_image(url):
+              """Telegram CDN -> Binance S3 -> hosted image URL. Returns None on failure:
+              a missing chart must never stop the signal going out."""
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      blob = r.read()
+                  print(f"downloaded chart: {len(blob)} bytes")
+
+                  d = api("/image/presignedUrl", {"imageName": "chart.jpg"})
+                  put = urllib.request.Request(
+                      d["presignedUrl"], data=blob,
+                      headers={"Content-Type": "image/jpeg"}, method="PUT")
+                  with urllib.request.urlopen(put, timeout=60) as r:
+                      if r.status not in (200, 204):
+                          raise RuntimeError(f"S3 PUT returned {r.status}")
+
+                  # Binance processes asynchronously: 1 = ready, 2 = failed.
+                  for attempt in range(10):
+                      st = api("/image/imageStatus", {"fileTicket": d["fileTicket"]})
+                      if st.get("status") == 1:
+                          print(f"image ready: {st.get('imageUrl')}")
+                          return st.get("imageUrl")
+                      if st.get("status") == 2:
+                          raise RuntimeError(f"processing failed: {st.get('failedReason')}")
+                      time.sleep(3)
+                  raise RuntimeError("image processing timed out")
+              except Exception as exc:
+                  print(f"::warning::image upload failed, posting text only: {exc}")
+                  return None
+
+          image_url = os.environ.get("POST_IMAGE", "").strip()
+          hosted = upload_image(image_url) if image_url else None
+
           print("--- publishing ---")
           print(text)
 
+          body = {"contentType": 1, "bodyTextOnly": text}
+          if hosted:
+              body["imageList"] = [hosted]
+
           status, raw = http(
               "https://www.binance.com/bapi/composite/v1/public/pgc/openApi/content/add",
-              {"contentType": 1, "bodyTextOnly": text},
+              body,
               {"X-Square-OpenAPI-Key": key, "Content-Type": "application/json",
                "clienttype": "binanceSkill"},
           )
@@ -97,6 +155,7 @@ jobs:
                   f"TP: {meta.get('tps','')}\n\n"
                   f"{shown}\n\n"
                   f"Post {meta.get('used','?')}/{meta.get('cap','?')} today"
+                  + ("\n📊 chart attached" if hosted else "")
               )
               for cid in chats:
                   try:
