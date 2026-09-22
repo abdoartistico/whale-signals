@@ -1,6 +1,6 @@
 /** Offline checks. Run: node test.mjs */
 
-import { parseMessage, parsePumpDetector, parseCycloneRSI, buildSetup, render, extractPosts } from "./src/worker.js";
+import { parseMessage, parsePumpDetector, parseCycloneRSI, buildSetup, render, extractPosts, chooseFor } from "./src/worker.js";
 
 const CFG = { entryZonePct: 0.4, stopLossPct: 7.0, takeProfitPcts: [4.0, 8.0, 12.0] };
 const fails = [];
@@ -185,6 +185,39 @@ eq("avatar is not treated as a chart", extractPosts(NOPIC)[0][2], null);
 
 // --- the image must reach the publisher ---
 eq("dispatch sends the image input", /inputs: \{ text, meta: JSON\.stringify\(meta\), image/.test(wsrc), true);
+
+// --- two accounts: never the same post, never the same moment ---
+const mk = (id, symbol) => ({ sig: { msgId: id, symbol }, image: null });
+const pool = [mk(1, "AAAUSDT"), mk(2, "BBBUSDT"), mk(3, "CCCUSDT"), mk(4, "DDDUSDT")];
+
+// nothing posted yet -> newest
+eq("picks the newest when nothing is posted", chooseFor(pool, []).sig.msgId, 4);
+
+// account A took msg 4; B must not repeat it
+const afterA = [{ id: 4, symbol: "DDDUSDT", ms: Date.now(), account: "a" }];
+const bPick = chooseFor(pool, afterA);
+eq("second account never repeats the same message", bPick.sig.msgId === 4, false);
+eq("second account also avoids the same symbol", bPick.sig.symbol === "DDDUSDT", false);
+eq("second account takes the next newest unused", bPick.sig.msgId, 3);
+
+// every id used -> nothing to post rather than a duplicate
+const allUsed = pool.map((e) => ({ id: e.sig.msgId, symbol: e.sig.symbol, ms: Date.now(), account: "a" }));
+eq("no duplicate when everything is used", chooseFor(pool, allUsed), null);
+
+// same symbol recently posted under a different message id -> still allowed as fallback,
+// so a busy symbol cannot starve the feed
+const dupSymbols = [mk(10, "AAAUSDT"), mk(11, "AAAUSDT")];
+const fb = chooseFor(dupSymbols, [{ id: 10, symbol: "AAAUSDT", ms: Date.now(), account: "a" }]);
+eq("falls back to a repeated symbol rather than posting nothing", fb.sig.msgId, 11);
+
+// config invariants that keep the two profiles apart and inside Binance's limits
+eq("per-account cap is under Binance's 100", Number(src.match(/maxPostsPerDay:\s*(\d+)/)[1]) < 100, true);
+const anyGap = Number(src.match(/minMinutesBetweenAnyPosts:\s*(\d+)/)[1]);
+eq("a cross-account gap is enforced", anyGap > 0, true);
+eq("cross-account gap is shorter than per-account pacing", anyGap < gap, true);
+eq("two accounts are configured", (src.match(/\{ key: "[ab]", label: "[AB]" \}/g) || []).length, 2);
+eq("account is passed to the publisher", /account: account \|\| "a"/.test(wsrc), true);
+eq("wording is salted per account", /acct\.key === "b" \? 977 : 0/.test(wsrc), true);
 
 if (fails.length) {
   console.log("FAILED:");

@@ -24,11 +24,17 @@ on:
         required: false
         default: ""
         type: string
+      account:
+        description: "Which Binance Square profile to publish as"
+        required: false
+        default: "a"
+        type: string
 
 permissions: {}
 
 concurrency:
-  group: publish-square
+  # per account: the two profiles must not serialise behind each other
+  group: publish-square-${{ inputs.account }}
   cancel-in-progress: false
 
 jobs:
@@ -37,7 +43,9 @@ jobs:
     steps:
       - name: Publish to Binance Square, then confirm on Telegram
         env:
-          SQUARE_KEY: ${{ secrets.BINANCE_SQUARE_KEY }}
+          SQUARE_KEY_A: ${{ secrets.BINANCE_SQUARE_KEY }}
+          SQUARE_KEY_B: ${{ secrets.BINANCE_SQUARE_KEY_2 }}
+          ACCOUNT: ${{ inputs.account }}
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TG_CHATS: ${{ secrets.TELEGRAM_CHAT_ID }}
           POST_TEXT: ${{ inputs.text }}
@@ -49,7 +57,13 @@ jobs:
 
           text = os.environ["POST_TEXT"]
           meta = json.loads(os.environ.get("POST_META") or "{}")
-          key  = os.environ["SQUARE_KEY"]
+          # Two profiles post from this one channel; pick the right credential.
+          account = (os.environ.get("ACCOUNT") or "a").strip().lower()
+          key = os.environ.get("SQUARE_KEY_B" if account == "b" else "SQUARE_KEY_A", "").strip()
+          if not key:
+              print(f"::error::no API key configured for account '{account}'")
+              sys.exit(1)
+          print(f"publishing as account {account.upper()}")
 
           def http(url, payload, headers, timeout=30):
               req = urllib.request.Request(
@@ -148,7 +162,7 @@ jobs:
           if ok and tg_token and chats:
               shown = link or (f"({note})" if note else "(link unavailable)")
               msg = (
-                  "✅ Posted to Binance Square\n\n"
+                  f"✅ Posted to Binance Square ({meta.get('account','?')})\n\n"
                   f"{meta.get('ticker','')} — {meta.get('direction','')}\n"
                   f"Entry: {meta.get('entry','')}\n"
                   f"SL: {meta.get('sl','')}\n"

@@ -28,15 +28,28 @@ const CONFIG = {
   allowShorts: true,
   usdtPairsOnly: true,
 
-  // Binance Square limits: 100 posts/day. Stay under it with margin.
-  maxPostsPerDay: 95,
-  minMinutesBetweenPosts: 15, // 15 min => at most 96/day, so the cap cannot be hit
+  // Binance Square limits are PER ACCOUNT: 100 posts/day, 400 uploads/day.
+  maxPostsPerDay: 95,          // per account
+  minMinutesBetweenPosts: 15,  // per account => at most 96/day, cap unreachable
+  // Across accounts: no two posts may land within this many minutes of each other,
+  // so the two profiles never publish at the same time.
+  minMinutesBetweenAnyPosts: 6,
+  // The same coin will not be republished by either account inside this window,
+  // so the two feeds do not mirror each other. Relaxed if nothing else is available.
+  symbolCooldownHours: 4,
   // Publishing goes through the GitHub Action (see publishing section for why).
   // Telegram receives a confirmation with the Binance post link from that Action.
 };
 
 // WhaleTracker and the pump channel are kept and still parsed by tests, but dormant.
 const SOURCES = [{ key: "cyclonersi", channel: "CycloneRSI" }];
+
+// Two Binance Square profiles drawing from the same channel. Their API keys live in
+// GitHub secrets (the Worker never touches Binance directly), selected by this key.
+const ACCOUNTS = [
+  { key: "a", label: "A" },
+  { key: "b", label: "B" },
+];
 
 // Excluded assets: pegged coins, fiat tokens, gold-backed (PAXG/XAUT) and PEPE,
 // all as requested. Symbols are matched uppercase against the parsed base.
@@ -615,7 +628,7 @@ const WORKFLOW_FILE = "publish-square.yml";
  * Trigger the GitHub workflow that publishes to Binance Square.
  * Returns 204 with no body on success.
  */
-export async function dispatchPublish(env, text, meta, image) {
+export async function dispatchPublish(env, text, meta, image, account) {
   const repo = env.GITHUB_REPO || "abdoartistico/whale-signals";
   const token = env.GITHUB_TOKEN || "";
   if (!token) return { ok: false, error: "GITHUB_TOKEN is not set" };
@@ -633,7 +646,7 @@ export async function dispatchPublish(env, text, meta, image) {
       },
       body: JSON.stringify({
         ref: env.GITHUB_REF || "main",
-        inputs: { text, meta: JSON.stringify(meta), image: image || "" },
+        inputs: { text, meta: JSON.stringify(meta), image: image || "", account: account || "a" },
       }),
     });
   } catch (err) {
@@ -649,32 +662,57 @@ export async function dispatchPublish(env, text, meta, image) {
 
 const utcDay = (ms) => new Date(ms).toISOString().slice(0, 10);
 
-/** Reset the daily counter when the UTC date rolls over (Binance quotas reset 00:00 UTC). */
-function rollQuota(state, nowMs) {
+/** Per-account daily counter; Binance quotas reset at 00:00 UTC. */
+function accountState(state, acct, nowMs) {
   const today = utcDay(nowMs);
-  if (!state.quota || state.quota.date !== today) {
-    state.quota = { date: today, count: 0, lastPostMs: state.quota?.lastPostMs || 0 };
-    return true;
+  if (!state.accounts) state.accounts = {};
+  let a = state.accounts[acct];
+  if (!a || a.date !== today) {
+    a = { date: today, count: 0, lastPostMs: a?.lastPostMs || 0 };
+    state.accounts[acct] = a;
   }
-  return false;
+  return a;
+}
+
+/** Drop history older than the symbol cooldown so the list cannot grow forever. */
+function prunePosted(state, nowMs) {
+  const cutoff = nowMs - CONFIG.symbolCooldownHours * 3600 * 1000;
+  state.posted = (state.posted || []).filter((e) => e.ms >= cutoff).slice(-400);
+  return state.posted;
+}
+
+/**
+ * Choose what an account should publish.
+ * Never repeats a message either account already posted; prefers a coin neither has
+ * posted recently, but falls back to a repeated symbol rather than posting nothing.
+ */
+export function chooseFor(eligible, posted) {
+  const usedIds = new Set(posted.map((e) => e.id));
+  const recentSymbols = new Set(posted.map((e) => e.symbol));
+  const unused = eligible.filter((e) => !usedIds.has(e.sig.msgId));
+  if (!unused.length) return null;
+  for (let i = unused.length - 1; i >= 0; i--) {
+    if (!recentSymbols.has(unused[i].sig.symbol)) return unused[i];
+  }
+  return unused[unused.length - 1]; // every symbol seen recently: take the newest anyway
 }
 
 async function runOnce(env, { dryRun = false, force = false } = {}) {
-
   if (!env.GITHUB_TOKEN && !dryRun) return { error: "GITHUB_TOKEN is not set" };
 
   const nowMs = Date.now();
   const stored = await env.STATE.get("state", { type: "json" });
-  const state = stored || { templateIndex: 0, sentTotal: 0, channels: {} };
+  const state = stored || { sentTotal: 0, channels: {} };
   if (!state.channels) state.channels = {};
-  if (state.lastId && state.channels.whaletracker === undefined) state.channels.whaletracker = state.lastId;
-  const rolled = rollQuota(state, nowMs);
+  const posted = prunePosted(state, nowMs);
 
   const log = [];
   const perSource = {};
-  let posted = 0;
-  let changed = rolled;
+  let dispatched = 0;
+  let changed = false;
 
+  // --- collect eligible signals from the source ---
+  let eligible = [];
   for (const src of SOURCES) {
     const since = state.channels[src.key] || 0;
     let posts;
@@ -695,8 +733,6 @@ async function runOnce(env, { dryRun = false, force = false } = {}) {
     const fresh = posts.filter(([id]) => id > since).sort((a, b) => a[0] - b[0]);
     const highest = posts.reduce((m, [id]) => Math.max(m, id), since);
 
-    // Everything that survives the coin filter, newest last.
-    const eligible = [];
     for (const [id, text, image] of fresh) {
       const sig = PARSERS[src.key](text, id);
       if (!sig) continue;
@@ -707,71 +743,89 @@ async function runOnce(env, { dryRun = false, force = false } = {}) {
     }
 
     perSource[src.key] = { fetched: posts.length, fresh: fresh.length, eligible: eligible.length, lastId: highest };
-
-    // Rate gates. Binance allows 100 posts/day; we pace instead of burning the quota
-    // in the first hours, and we publish the NEWEST eligible signal in the window.
-    const sinceLastMin = (nowMs - (state.quota.lastPostMs || 0)) / 60000;
-    const quotaLeft = CONFIG.maxPostsPerDay - state.quota.count;
-
-    if (eligible.length === 0) {
-      if (fresh.length) log.push(`${src.key}: ${fresh.length} fresh, none eligible after coin filter`);
-    } else if (quotaLeft <= 0 && !force) {
-      log.push(`daily cap reached (${state.quota.count}/${CONFIG.maxPostsPerDay}), waiting for UTC reset`);
-    } else if (sinceLastMin < CONFIG.minMinutesBetweenPosts && !force) {
-      log.push(`pacing: ${(CONFIG.minMinutesBetweenPosts - sinceLastMin).toFixed(1)} min until next post`);
-    } else {
-      const { sig, image } = eligible[eligible.length - 1]; // newest is the most tradable
-      const s = buildSetup(sig, CONFIG);
-      const text = render(s, sig.msgId);
-
-      if (dryRun) {
-        log.push(`[dry] ${sig.symbol} ${s.direction} (${eligible.length} eligible, posting newest)\nimage: ${image || "none"}\n${text}`);
-      } else {
-        const meta = {
-          image: image || "",
-          ticker: s.ticker,
-          direction: s.direction,
-          entry: `${s.entryLow} - ${s.entryHigh}`,
-          sl: s.stop,
-          tps: s.targets.join(" / "),
-          used: state.quota.count + 1,
-          cap: CONFIG.maxPostsPerDay,
-        };
-        const r = await dispatchPublish(env, text, meta, image);
-        if (!r.ok) {
-          log.push(`dispatch FAILED ${sig.symbol}: ${r.error}`);
-        } else {
-          // Dispatch accepted. The Action performs the Binance post and sends the
-          // Telegram confirmation with the link. Counting here (rather than on the
-          // Action's result) can only ever under-post, never breach the daily cap.
-          log.push(`dispatched ${sig.symbol} ${s.direction}${image ? " +image" : " (no image)"} to GitHub for publishing`);
-          state.quota.count += 1;
-          state.quota.lastPostMs = nowMs;
-          state.sentTotal = (state.sentTotal || 0) + 1;
-          posted += 1;
-        }
-      }
-    }
-
     if (highest !== since) {
-      // Advance past everything seen, posted or not -- skipped alerts are stale by the
-      // next window and must not queue up behind the rate limit.
+      // Advance past everything seen. Alerts the rate limit skipped are stale by the
+      // next window and must not queue up behind it.
       state.channels[src.key] = highest;
       changed = true;
     }
   }
 
-  if ((changed || posted) && !dryRun) {
+  // --- hand one signal to each account that is due ---
+  const accounts = {};
+  for (const acct of ACCOUNTS) {
+    const a = accountState(state, acct.key, nowMs);
+    accounts[acct.key] = { used: a.count, cap: CONFIG.maxPostsPerDay };
+
+    const sinceOwn = (nowMs - (a.lastPostMs || 0)) / 60000;
+    const sinceAny = (nowMs - (state.lastAnyPostMs || 0)) / 60000;
+
+    if (!eligible.length) continue;
+    if (a.count >= CONFIG.maxPostsPerDay && !force) {
+      log.push(`${acct.label}: daily cap ${a.count}/${CONFIG.maxPostsPerDay}, waiting for UTC reset`);
+      continue;
+    }
+    if (sinceOwn < CONFIG.minMinutesBetweenPosts && !force) {
+      log.push(`${acct.label}: own pacing, ${(CONFIG.minMinutesBetweenPosts - sinceOwn).toFixed(1)} min to go`);
+      continue;
+    }
+    if (sinceAny < CONFIG.minMinutesBetweenAnyPosts && !force) {
+      // keeps the two profiles from posting at the same moment
+      log.push(`${acct.label}: spacing from the other account, ${(CONFIG.minMinutesBetweenAnyPosts - sinceAny).toFixed(1)} min to go`);
+      continue;
+    }
+
+    const chosen = chooseFor(eligible, posted);
+    if (!chosen) {
+      log.push(`${acct.label}: nothing new to post (all candidates already used)`);
+      continue;
+    }
+    const { sig, image } = chosen;
+    const s = buildSetup(sig, CONFIG);
+    // salt the seed per account so wording diverges even for a similar setup
+    const text = render(s, sig.msgId + (acct.key === "b" ? 977 : 0));
+
+    if (dryRun) {
+      log.push(`[dry ${acct.label}] ${sig.symbol} ${s.direction}\nimage: ${image || "none"}\n${text}`);
+      posted.push({ id: sig.msgId, symbol: sig.symbol, ms: nowMs, account: acct.key });
+      continue;
+    }
+
+    const meta = {
+      account: acct.label,
+      image: image || "",
+      ticker: s.ticker,
+      direction: s.direction,
+      entry: `${s.entryLow} - ${s.entryHigh}`,
+      sl: s.stop,
+      tps: s.targets.join(" / "),
+      used: a.count + 1,
+      cap: CONFIG.maxPostsPerDay,
+    };
+    const r = await dispatchPublish(env, text, meta, image, acct.key);
+    if (!r.ok) {
+      log.push(`${acct.label}: dispatch FAILED ${sig.symbol}: ${r.error}`);
+      continue;
+    }
+    log.push(`${acct.label}: dispatched ${sig.symbol} ${s.direction}${image ? " +image" : " (no image)"}`);
+    a.count += 1;
+    a.lastPostMs = nowMs;
+    state.lastAnyPostMs = nowMs;
+    state.sentTotal = (state.sentTotal || 0) + 1;
+    posted.push({ id: sig.msgId, symbol: sig.symbol, ms: nowMs, account: acct.key });
+    accounts[acct.key].used = a.count;
+    dispatched += 1;
+    changed = true;
+  }
+
+  if (changed && !dryRun) {
     delete state.lastId;
+    delete state.quota;
+    state.posted = posted;
     await env.STATE.put("state", JSON.stringify(state));
   }
 
-  return {
-    sources: perSource,
-    posted,
-    quota: { used: state.quota.count, cap: CONFIG.maxPostsPerDay, date: state.quota.date },
-    log,
-  };
+  return { sources: perSource, dispatched, accounts, recentlyPosted: posted.length, log };
 }
 
 export default {
@@ -785,7 +839,7 @@ export default {
       new Response(JSON.stringify(o, null, 2), { status, headers: { "content-type": "application/json" } });
 
     if (url.pathname === "/health")
-      return json({ ok: true, sources: SOURCES.map((s) => s.channel), destination: CONFIG.postToBinanceSquare ? "binance-square" : "telegram" });
+      return json({ ok: true, sources: SOURCES.map((s) => s.channel), accounts: ACCOUNTS.map((a) => a.label) });
     if (url.pathname === "/state") return json((await env.STATE.get("state", { type: "json" })) || { channels: {} });
     if (url.pathname === "/dry") return json(await runOnce(env, { dryRun: true }));
     if (url.pathname === "/run") {
