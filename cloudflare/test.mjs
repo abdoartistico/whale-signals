@@ -3,7 +3,7 @@
 import { readFileSync } from "fs";
 import {
   parseCycloneRSI, parseMessage, parsePumpDetector,
-  buildSetup, render, extractPosts, chooseFor,
+  buildSetup, render, extractPosts, chooseFor, targetGapMinutes,
 } from "./src/worker.js";
 
 const CFG = { entryZonePct: 0.5, stopLossPct: 7.0, takeProfitPcts: [4.0, 8.0, 12.0] };
@@ -130,13 +130,58 @@ eq("falls back to a repeated symbol before posting nothing",
    chooseFor(dup, [{ id: 10, symbol: "AAAUSDT", ms: Date.now(), account: "a" }]).sig.msgId, 11);
 
 const cap = Number(src.match(/maxPostsPerDay:\s*(\d+)/)[1]);
-const own = Number(src.match(/minMinutesBetweenPosts:\s*(\d+)/)[1]);
 const any = Number(src.match(/minMinutesBetweenAnyPosts:\s*(\d+)/)[1]);
+const floor = Number(src.match(/minGapFloorMinutes:\s*(\d+)/)[1]);
 eq("per-account cap is under Binance's 100", cap < 100, true);
-eq("own pacing cannot exceed the daily cap", Math.floor((24 * 60) / own) <= 100, true);
 eq("a cross-account gap is enforced", any > 0, true);
-eq("cross-account gap is shorter than own pacing", any < own, true);
 eq("two accounts configured", (src.match(/\{ key: "[ab]", label: "[AB]" \}/g) || []).length, 2);
+
+// ---------------------------------------------------------------- pacing
+// A FIXED gap could never reach the quota: with a 2-minute cron the smallest real
+// gap is 16 min, capping an account at 90/day. The gap is therefore adaptive.
+const midnight = Date.UTC(2026, 8, 24, 0, 0, 0);
+const CFGP = { maxPostsPerDay: cap, minGapFloorMinutes: floor };
+near("at day start the gap spreads the full quota", targetGapMinutes(0, midnight, CFGP), 1440 / cap, 0.1);
+const halfway = midnight + 12 * 3600 * 1000;
+near("on track at midday the gap holds steady", targetGapMinutes(Math.round(cap / 2), halfway, CFGP), 720 / (cap - Math.round(cap / 2)), 0.2);
+eq("falling behind tightens the gap",
+   targetGapMinutes(10, halfway, CFGP) < targetGapMinutes(0, midnight, CFGP), true);
+eq("the gap never drops below the floor",
+   targetGapMinutes(0, midnight + 1439 * 60000, CFGP) >= floor, true);
+eq("a finished quota stops posting", targetGapMinutes(cap, halfway, CFGP), Infinity);
+
+// A full simulated day must let BOTH accounts finish their quota, including through
+// a long quiet spell -- the regression that left the second account ~30% short.
+function simulateDay({ quiet = [] } = {}) {
+  const acc = { a: { count: 0, last: 0 }, b: { count: 0, last: 0 } };
+  let lastAny = 0, msgs = [], nextId = 1;
+  const posted = new Set();
+  for (let m = 0; m < 1440; m += 2) {
+    const now = midnight + m * 60000;
+    if (!quiet.some(([s, e]) => m >= s && m < e)) {
+      for (let i = 0; i < 1; i++) msgs.push({ id: nextId++, t: now });
+    }
+    const pool = msgs.filter((x) => !posted.has(x.id) && now - x.t <= 25 * 60000);
+    const order = Object.keys(acc).sort((x, y) => acc[x].count - acc[y].count || acc[x].last - acc[y].last);
+    for (const k of order) {
+      const a = acc[k];
+      if (a.count >= cap) continue;
+      if ((now - a.last) / 60000 < targetGapMinutes(a.count, now, CFGP)) continue;
+      if ((now - lastAny) / 60000 < any) continue;
+      const pick = pool.filter((x) => !posted.has(x.id)).pop();
+      if (!pick) continue;
+      posted.add(pick.id); a.count++; a.last = now; lastAny = now;
+    }
+    msgs = msgs.filter((x) => now - x.t <= 30 * 60000);
+  }
+  return acc;
+}
+const day = simulateDay();
+eq("account A reaches its quota over a day", day.a.count >= cap - 2, true);
+eq("account B reaches its quota over a day", day.b.count >= cap - 2, true);
+eq("neither account exceeds the cap", day.a.count <= cap && day.b.count <= cap, true);
+const rough = simulateDay({ quiet: [[600, 690]] });
+eq("both recover from a 90-minute quiet spell", rough.a.count >= cap - 3 && rough.b.count >= cap - 3, true);
 
 // ---------------------------------------------------------------- images
 const HTML =

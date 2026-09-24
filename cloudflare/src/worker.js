@@ -29,11 +29,18 @@ const CONFIG = {
   usdtPairsOnly: true,
 
   // Binance Square limits are PER ACCOUNT: 100 posts/day, 400 uploads/day.
-  maxPostsPerDay: 95,          // per account
-  minMinutesBetweenPosts: 15,  // per account => at most 96/day, cap unreachable
-  // Across accounts: no two posts may land within this many minutes of each other,
-  // so the two profiles never publish at the same time.
-  minMinutesBetweenAnyPosts: 6,
+  maxPostsPerDay: 95, // per account
+  // Pacing is ADAPTIVE: the gap is recomputed each tick as (minutes left in the UTC
+  // day) / (posts left today), so an account spreads exactly its quota across the day
+  // and catches up automatically after a quiet spell. A fixed 15-minute gap could
+  // never reach the quota at all -- with a 2-minute cron the smallest real gap is 16
+  // minutes, which caps an account at 90/day.
+  minGapFloorMinutes: 5, // never burst faster than this, even when far behind
+  // Across accounts: no two posts land within this many minutes of each other.
+  minMinutesBetweenAnyPosts: 4,
+  // Candidates are drawn from the whole fetched page, not just the newest tick, so a
+  // quiet 2-minute window cannot starve an account. Anything older than this is stale.
+  maxSignalAgeMinutes: 25,
   // The same coin will not be republished by either account inside this window,
   // so the two feeds do not mirror each other. Relaxed if nothing else is available.
   symbolCooldownHours: 4,
@@ -107,7 +114,7 @@ function stripHtml(fragment) {
 }
 
 /**
- * Pull [id, text, imageUrl] triples out of the public web preview.
+ * Pull [id, text, imageUrl, isoTime] tuples out of the public web preview.
  *
  * Splits on the per-message marker so a photo can never be paired with the wrong
  * message, and matches the photo wrapper specifically -- a bare background-image
@@ -136,7 +143,11 @@ export function extractPosts(html) {
       if (m) image = m[1];
     }
 
-    out.push([id, text, image]);
+    let time = null;
+    const tmAt = p.indexOf('<time datetime="');
+    if (tmAt !== -1) time = p.slice(tmAt + 16, p.indexOf('"', tmAt + 16));
+
+    out.push([id, text, image, time]);
     if (out.length > 120) break;
   }
   return out;
@@ -598,6 +609,22 @@ function accountState(state, acct, nowMs) {
   return a;
 }
 
+/**
+ * Minutes an account should wait between posts right now.
+ *
+ * Spreads the remaining quota evenly across the remainder of the UTC day. Early in
+ * the day with a full quota this is ~15 min; after a quiet spell it tightens so the
+ * account catches back up, and it never goes below the floor.
+ */
+export function targetGapMinutes(count, nowMs, cfg = CONFIG) {
+  const end = Date.UTC(new Date(nowMs).getUTCFullYear(), new Date(nowMs).getUTCMonth(),
+                       new Date(nowMs).getUTCDate() + 1);
+  const minutesLeft = Math.max(0, (end - nowMs) / 60000);
+  const postsLeft = cfg.maxPostsPerDay - count;
+  if (postsLeft <= 0) return Infinity;
+  return Math.max(cfg.minGapFloorMinutes, minutesLeft / postsLeft);
+}
+
 /** Drop history older than the symbol cooldown so the list cannot grow forever. */
 function prunePosted(state, nowMs) {
   const cutoff = nowMs - CONFIG.symbolCooldownHours * 3600 * 1000;
@@ -654,44 +681,66 @@ async function runOnce(env, { dryRun = false, force = false } = {}) {
       continue;
     }
 
-    const fresh = posts.filter(([id]) => id > since).sort((a, b) => a[0] - b[0]);
     const highest = posts.reduce((m, [id]) => Math.max(m, id), since);
+    const maxAgeMs = CONFIG.maxSignalAgeMinutes * 60000;
 
-    for (const [id, text, image] of fresh) {
+    // Candidates come from the WHOLE page, not only messages newer than the pointer.
+    // Drawing from the last tick alone meant an account that became eligible during a
+    // quiet 2-minute window lost its slot entirely, because the pointer had already
+    // moved past those messages. Duplicates are prevented by the posted history, not
+    // by the pointer, so widening this is safe.
+    for (const [id, text, image, time] of posts.sort((a, b) => a[0] - b[0])) {
       const sig = PARSERS[src.key](text, id);
       if (!sig) continue;
       if (CONFIG.usdtPairsOnly && !STABLE_QUOTES.has(sig.quote)) continue;
       if (CONFIG.excludeStablecoins && STABLE_BASES.has(sig.base)) continue;
       if (!CONFIG.allowShorts && sig.side === "sell") continue;
+      if (time) {
+        const age = nowMs - Date.parse(time);
+        if (age > maxAgeMs) continue; // stale: the move has already played out
+      }
       eligible.push({ sig, image });
     }
 
-    perSource[src.key] = { fetched: posts.length, fresh: fresh.length, eligible: eligible.length, lastId: highest };
+    perSource[src.key] = {
+      fetched: posts.length,
+      fresh: posts.filter(([id]) => id > since).length,
+      candidates: eligible.length,
+      lastId: highest,
+    };
     if (highest !== since) {
-      // Advance past everything seen. Alerts the rate limit skipped are stale by the
-      // next window and must not queue up behind it.
       state.channels[src.key] = highest;
       changed = true;
     }
   }
 
   // --- hand one signal to each account that is due ---
-  if (!eligible.length) log.push("no new eligible signals this tick");
+  if (!eligible.length) log.push("no eligible candidates this tick");
   const accounts = {};
-  for (const acct of ACCOUNTS) {
+
+  // Evaluate the account that is furthest behind FIRST. Fixed order meant whichever
+  // account came first won every contested tick and the other absorbed all the slack,
+  // which is what left the second profile ~20% short of its quota.
+  const order = [...ACCOUNTS].sort((x, y) => {
+    const ax = accountState(state, x.key, nowMs), ay = accountState(state, y.key, nowMs);
+    return ax.count - ay.count || (ax.lastPostMs || 0) - (ay.lastPostMs || 0);
+  });
+
+  for (const acct of order) {
     const a = accountState(state, acct.key, nowMs);
     accounts[acct.key] = { used: a.count, cap: CONFIG.maxPostsPerDay };
 
     const sinceOwn = (nowMs - (a.lastPostMs || 0)) / 60000;
     const sinceAny = (nowMs - (state.lastAnyPostMs || 0)) / 60000;
+    const needGap = targetGapMinutes(a.count, nowMs);
 
     if (!eligible.length) continue;
     if (a.count >= CONFIG.maxPostsPerDay && !force) {
       log.push(`${acct.label}: daily cap ${a.count}/${CONFIG.maxPostsPerDay}, waiting for UTC reset`);
       continue;
     }
-    if (sinceOwn < CONFIG.minMinutesBetweenPosts && !force) {
-      log.push(`${acct.label}: own pacing, ${(CONFIG.minMinutesBetweenPosts - sinceOwn).toFixed(1)} min to go`);
+    if (sinceOwn < needGap && !force) {
+      log.push(`${acct.label}: pacing ${(needGap - sinceOwn).toFixed(1)} min to go (target gap ${needGap.toFixed(1)})`);
       continue;
     }
     if (sinceAny < CONFIG.minMinutesBetweenAnyPosts && !force) {
@@ -739,6 +788,7 @@ async function runOnce(env, { dryRun = false, force = false } = {}) {
     state.sentTotal = (state.sentTotal || 0) + 1;
     posted.push({ id: sig.msgId, symbol: sig.symbol, ms: nowMs, account: acct.key });
     accounts[acct.key].used = a.count;
+    accounts[acct.key].targetGap = Number(targetGapMinutes(a.count, nowMs).toFixed(1));
     dispatched += 1;
     changed = true;
   }
