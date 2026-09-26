@@ -550,96 +550,155 @@ const CTAS = [
 ];
 
 // --- account B: institutional desk voice, no chart attached ---------------------
-// 28 descriptions per direction and 24 CTAs, so B never reads like A.
+//
+// Descriptions are COMPOSED, not picked from a list of finished sentences. A fixed
+// list of N lines repeats verbatim every N posts; composing from independent slots
+// multiplies out instead:
+//
+//   <lead clause> + <", with ..." evidence> + <closing sentence>
+//   16 x 16 x 14  = 3,584 descriptions per direction
+//
+// Every lead is a standalone clause, every evidence fragment is a "with X doing Y"
+// phrase, and every outlook is a full sentence, so any combination is grammatical.
 
-const INST_LONG_DESCS = [
-  (f) => `Momentum has flipped decisively bullish on the ${f.tf} and order books are thinning above spot.`,
-  (f) => `Volume expansion is confirming the breakout structure, with buyers controlling every retest.`,
-  (f) => `Aggressive accumulation is showing through the tape — ${f.tf} RSI at ${f.rsi} and still climbing.`,
-  (f) => `Breakout structure is intact: resistance has flipped to support and demand is absorbing supply.`,
-  (f) => `Liquidity is rotating into this pair fast, and the ${f.tf} trend has turned firmly upward.`,
-  (f) => `Buy-side pressure is compounding while resting offers disappear — a textbook continuation profile.`,
-  (f) => `Institutional-sized bids are stepping in and momentum is expanding out of compression.`,
-  (f) => `${f.tf} RSI printed ${f.rsi}: strength is confirming, not exhausting, and volume backs the move.`,
-  (f) => `Order flow has turned one-sided to the bid, with each dip bought faster than the last.`,
-  (f) => `Breakout velocity is accelerating as thin overhead liquidity gives way to demand.`,
-  (f) => `The trend structure is clean — higher lows into resistance with volume confirming the push.`,
-  (f) => `Demand is overwhelming available supply and price is discovering higher levels on ${f.exch}.`,
-  (f) => `Momentum expansion underway: participation is rising and sellers are stepping aside.`,
-  (f) => `A decisive shift in order-flow favours longs, with the ${f.tf} structure turning constructive.`,
-  (f) => `Buyers are lifting every offer into a thinning book — continuation is the higher-probability path.`,
-  (f) => `Volume profile has tilted hard to the buy side, and the breakout is holding its retest.`,
-  (f) => `Sustained bid absorption at RSI ${f.rsi} points to real positioning rather than a squeeze.`,
-  (f) => `Trend acceleration on the ${f.tf} with momentum, volume and structure all pointing the same way.`,
-  (f) => `Supply overhead has been cleared and price is now trading in open air above prior resistance.`,
-  (f) => `Capital is rotating in aggressively — the ${f.tf} chart has broken out of its consolidation.`,
-  (f) => `Buy pressure is sustained rather than spiky, which is what separates continuation from a fakeout.`,
-  (f) => `Momentum is broadening across timeframes, with the ${f.tf} leading the expansion higher.`,
-  (f) => `The book is stacked bid-heavy and every pullback is being defended with size.`,
-  (f) => `Breakout confirmed on volume, with RSI ${f.rsi} signalling strength rather than exhaustion.`,
-  (f) => `Structure, flow and momentum are aligned bullish — a high-conviction continuation setup.`,
-  (f) => `Liquidity above is sparse and demand is persistent, a combination that tends to expand fast.`,
-  (f) => `Accumulation has matured into markup, with the ${f.tf} trend now firmly in control.`,
-  (f) => `Directional conviction is clear in the flow: buyers are paying up and sellers are absent.`,
+const INST_LEAD_LONG = [
+  (f) => `Momentum has flipped decisively bullish on the ${f.tf}`,
+  () => `Breakout structure is confirming on expanding volume`,
+  () => `Volume expansion is accelerating through this range`,
+  () => `Order flow has turned one-sided to the bid`,
+  (f) => `Price is breaking out of compression on the ${f.tf}`,
+  () => `Buyers have taken firm control of the tape`,
+  (f) => `The ${f.tf} trend has shifted into markup`,
+  () => `Liquidity is rotating into this pair at pace`,
+  () => `Demand is overwhelming resting supply`,
+  () => `The breakout is holding its retest cleanly`,
+  () => `Participation is expanding as price pushes higher`,
+  (f) => `Momentum is confirming strength at RSI ${f.rsi}`,
+  (f) => `Structure has turned constructive on the ${f.tf}`,
+  () => `Aggressive accumulation is showing through the book`,
+  () => `Upside velocity is building into thin resistance`,
+  (f) => `The ${f.tf} chart has cleared its overhead supply`,
 ];
 
-const INST_SHORT_DESCS = [
-  (f) => `Momentum has rolled over decisively on the ${f.tf} and bid-side liquidity is evaporating.`,
-  (f) => `Volume expansion is confirming the breakdown structure, with sellers controlling every bounce.`,
-  (f) => `Aggressive distribution is showing through the tape — ${f.tf} RSI at ${f.rsi} and still falling.`,
-  (f) => `Breakdown structure is intact: support has flipped to resistance and supply is overwhelming demand.`,
-  (f) => `Liquidity is rotating out of this pair fast, and the ${f.tf} trend has turned firmly downward.`,
-  (f) => `Sell-side pressure is compounding while resting bids disappear — a textbook continuation lower.`,
-  (f) => `Institutional-sized offers are stepping in and momentum is breaking out of compression to the downside.`,
-  (f) => `${f.tf} RSI printed ${f.rsi}: weakness is confirming, not washing out, and volume backs the move.`,
-  (f) => `Order flow has turned one-sided to the offer, with each bounce sold faster than the last.`,
-  (f) => `Breakdown velocity is accelerating as thin support gives way to persistent supply.`,
-  (f) => `The trend structure is clean — lower highs into support with volume confirming the push down.`,
-  (f) => `Supply is overwhelming available demand and price is discovering lower levels on ${f.exch}.`,
-  (f) => `Momentum contraction underway: participation is rising and buyers are stepping aside.`,
-  (f) => `A decisive shift in order-flow favours shorts, with the ${f.tf} structure turning destructive.`,
-  (f) => `Sellers are hitting every bid into a thinning book — continuation lower is the higher-probability path.`,
-  (f) => `Volume profile has tilted hard to the sell side, and the breakdown is holding its retest.`,
-  (f) => `Sustained offer absorption at RSI ${f.rsi} points to real distribution rather than a flush.`,
-  (f) => `Trend acceleration on the ${f.tf} with momentum, volume and structure all pointing lower.`,
-  (f) => `Support beneath has been cleared and price is now trading in open air below prior demand.`,
-  (f) => `Capital is rotating out aggressively — the ${f.tf} chart has broken down from its consolidation.`,
-  (f) => `Sell pressure is sustained rather than spiky, which is what separates breakdown from a shakeout.`,
-  (f) => `Weakness is broadening across timeframes, with the ${f.tf} leading the move lower.`,
-  (f) => `The book is stacked offer-heavy and every bounce is being sold into with size.`,
-  (f) => `Breakdown confirmed on volume, with RSI ${f.rsi} signalling weakness rather than capitulation.`,
-  (f) => `Structure, flow and momentum are aligned bearish — a high-conviction continuation setup.`,
-  (f) => `Liquidity below is sparse and supply is persistent, a combination that tends to accelerate.`,
-  (f) => `Distribution has matured into markdown, with the ${f.tf} trend now firmly in control.`,
-  (f) => `Directional conviction is clear in the flow: sellers are hitting bids and buyers are absent.`,
+const INST_EVID_LONG = [
+  () => `, with buyers absorbing every offer that appears`,
+  () => `, with resting supply thinning out quickly`,
+  () => `, with bids stacking deeper on each pullback`,
+  () => `, with volume confirming rather than fading`,
+  () => `, with dips being bought before they develop`,
+  () => `, with sellers stepping aside at every test`,
+  () => `, with the order book tilting firmly bid-heavy`,
+  () => `, with follow-through arriving on higher participation`,
+  () => `, with each retest defended by real size`,
+  () => `, with turnover expanding alongside price`,
+  () => `, with liquidity above growing noticeably thinner`,
+  () => `, with momentum broadening across timeframes`,
+  () => `, with demand outpacing supply on every leg`,
+  () => `, with buy-side aggression building steadily`,
+  () => `, with the bid refusing to give ground`,
+  () => `, with capital rotating in rather than out`,
 ];
 
-const INST_CTAS = [
-  "Follow for more institutional-grade setups 🚀",
-  "Save this one and track it to target 📌",
-  "Share it with a trader who needs this 🤝",
-  "Follow along — more setups drop daily 📈",
-  "Bookmark this and watch the levels play out 🔖",
-  "Hit follow so you never miss the next call 🔔",
-  "Save it, trade it, review it 📊",
-  "Repost if this helped your positioning 🔁",
-  "Follow the desk for real-time structure reads 🧠",
-  "Keep this on your watchlist 👀",
-  "Drop a follow for daily market structure 💡",
-  "Share the setup, help someone trade better 🤲",
-  "Save for later and manage the risk 🛡️",
-  "Follow for clean levels, not noise ✨",
-  "Add it to your watchlist and stay ready ⚡",
-  "Follow for more high-conviction ideas 💎",
-  "Bookmark the levels before price moves 🏁",
-  "Share this with your trading group 📣",
-  "Follow for the next breakout before it runs 🚀",
-  "Save this and compare it to the close 🕐",
-  "Tap follow for structured trade plans 📗",
-  "Pass it on if you found it useful 🙌",
-  "Follow to catch the next rotation early 🌊",
-  "Save it — the levels do the talking ✅",
+const INST_OUT_LONG = [
+  () => `. Continuation is favoured while this level holds.`,
+  () => `. The path of least resistance points higher.`,
+  () => `. Structure stays constructive above the entry zone.`,
+  () => `. Risk is defined and the upside remains open.`,
+  () => `. A push toward the targets looks reasonable from here.`,
+  () => `. Momentum should carry price into the next supply pocket.`,
+  () => `. This reads as expansion, not exhaustion.`,
+  () => `. The setup stays valid unless the stop is lost.`,
+  () => `. Follow-through from here would confirm the breakout.`,
+  () => `. Buyers remain in control of the next move.`,
+  () => `. Trend, flow and structure all point the same way.`,
+  (f) => `. The ${f.tf} bias stays firmly bullish.`,
+  () => `. Holding this zone keeps the targets in play.`,
+  () => `. Moves backed like this rarely resolve in one leg.`,
 ];
+
+const INST_LEAD_SHORT = [
+  (f) => `Momentum has rolled over decisively on the ${f.tf}`,
+  () => `Breakdown structure is confirming on expanding volume`,
+  () => `Volume expansion is accelerating to the downside`,
+  () => `Order flow has turned one-sided to the offer`,
+  (f) => `Price is breaking down out of compression on the ${f.tf}`,
+  () => `Sellers have taken firm control of the tape`,
+  (f) => `The ${f.tf} trend has shifted into markdown`,
+  () => `Liquidity is rotating out of this pair at pace`,
+  () => `Supply is overwhelming resting demand`,
+  () => `The breakdown is rejecting its retest cleanly`,
+  () => `Participation is expanding as price slides lower`,
+  (f) => `Momentum is confirming weakness at RSI ${f.rsi}`,
+  (f) => `Structure has turned destructive on the ${f.tf}`,
+  () => `Aggressive distribution is showing through the book`,
+  () => `Downside velocity is building into thin support`,
+  (f) => `The ${f.tf} chart has lost its underlying demand`,
+];
+
+const INST_EVID_SHORT = [
+  () => `, with sellers hitting every bid that appears`,
+  () => `, with resting demand thinning out quickly`,
+  () => `, with offers stacking heavier on each bounce`,
+  () => `, with volume confirming rather than fading`,
+  () => `, with rallies being sold before they develop`,
+  () => `, with buyers stepping aside at every test`,
+  () => `, with the order book tilting firmly offer-heavy`,
+  () => `, with follow-through arriving on higher participation`,
+  () => `, with each retest rejected by real size`,
+  () => `, with turnover expanding as price falls`,
+  () => `, with liquidity below growing noticeably thinner`,
+  () => `, with weakness broadening across timeframes`,
+  () => `, with supply outpacing demand on every leg`,
+  () => `, with sell-side aggression building steadily`,
+  () => `, with the offer refusing to give ground`,
+  () => `, with capital rotating out rather than in`,
+];
+
+const INST_OUT_SHORT = [
+  () => `. Continuation lower is favoured while this level caps price.`,
+  () => `. The path of least resistance points lower.`,
+  () => `. Structure stays weak beneath the entry zone.`,
+  () => `. Risk is defined and the downside remains open.`,
+  () => `. A push toward the targets looks reasonable from here.`,
+  () => `. Momentum should carry price into the next demand pocket.`,
+  () => `. This reads as breakdown, not capitulation.`,
+  () => `. The setup stays valid unless the stop is reclaimed.`,
+  () => `. Follow-through from here would confirm the breakdown.`,
+  () => `. Sellers remain in control of the next move.`,
+  () => `. Trend, flow and structure all point the same way.`,
+  (f) => `. The ${f.tf} bias stays firmly bearish.`,
+  () => `. Staying below this zone keeps the targets in play.`,
+  () => `. Moves backed like this rarely resolve in one leg.`,
+];
+
+// CTAs compose too: either a follow-style action plus an object, or a standalone
+// save/share line, then an emoji. (10 x 16 + 10) x 14 = 2,380 variants.
+const CTA_ACTION = [
+  "Follow for ", "Tap follow for ", "Stay tuned for ", "Subscribe for ",
+  "Follow the desk for ", "Stick with us for ", "Hit follow for ",
+  "Turn on alerts for ", "Follow along for ", "Watch this space for ",
+];
+
+const CTA_OBJECT = [
+  "more institutional-grade setups", "daily market structure reads",
+  "the next breakout before it runs", "clean levels without the noise",
+  "high-conviction trade plans", "real-time order-flow reads",
+  "setups posted around the clock", "the next rotation early",
+  "structured, risk-defined ideas", "more calls like this one",
+  "the levels that actually matter", "tomorrow's movers today",
+  "disciplined entries and exits", "charts worth acting on",
+  "the next high-probability setup", "signals built on structure",
+];
+
+const CTA_STANDALONE = [
+  "Save this one and track it to target", "Share it with a trader who needs it",
+  "Repost if this sharpened your view", "Bookmark the levels before price moves",
+  "Send it to your trading group", "Save it and compare at the close",
+  "Pass it on if it helped", "Add it to your watchlist",
+  "Keep it handy and manage the risk", "Drop it in your group chat",
+];
+
+const CTA_EMOJI = ["🚀", "📈", "💎", "⚡", "🔥", "📊", "🎯", "🔔", "💡", "🧠", "✅", "🏁", "📌", "🤝"];
 
 /**
  * Integer hash so each rotating slot is drawn independently.
@@ -657,14 +716,52 @@ function hash32(x) {
 
 const pick = (pool, seed, salt) => pool[hash32(Math.imul(seed, 0x9e3779b1) + Math.imul(salt, 0x85ebca6b)) % pool.length];
 
+/**
+ * Walk the FULL combination space without repeating.
+ *
+ * Random sampling repeats far sooner than the space size suggests -- with 3,584
+ * combinations the first collision lands around post 55 (birthday paradox), i.e.
+ * inside a single day. Multiplying the counter by a value coprime to the space size
+ * is a bijection modulo that size, so every combination is visited exactly once
+ * before any repeats, while consecutive posts still jump around unpredictably.
+ *
+ * `mult` must share no factor with the product of `sizes`.
+ */
+export function odometer(n, sizes, mult) {
+  const total = sizes.reduce((a, b) => a * b, 1);
+  let k = (((n % total) * mult) % total + total) % total;
+  const idx = [];
+  for (const s of sizes) {
+    idx.push(k % s);
+    k = Math.floor(k / s);
+  }
+  return idx;
+}
+
 export function render(s, seed) {
   const long = s.direction === "LONG";
   const inst = s.profile === "institutional";
-  const descPool = inst
-    ? (long ? INST_LONG_DESCS : INST_SHORT_DESCS)
-    : (long ? LONG_DESCS : SHORT_DESCS);
-  const desc = pick(descPool, seed, 7)(facts(s));
-  const cta = pick(inst ? INST_CTAS : CTAS, seed, 13);
+  const f = facts(s);
+  let desc, cta;
+  if (inst) {
+    const leads = long ? INST_LEAD_LONG : INST_LEAD_SHORT;
+    const evid = long ? INST_EVID_LONG : INST_EVID_SHORT;
+    const outs = long ? INST_OUT_LONG : INST_OUT_SHORT;
+    // 16 x 16 x 14 = 3,584; 1237 is odd and not a multiple of 7, so coprime to it
+    const [li, ei, oi] = odometer(seed, [leads.length, evid.length, outs.length], 1237);
+    desc = leads[li](f) + evid[ei](f) + outs[oi](f);
+
+    // CTA space: 10 x 16 action/object pairs plus 10 standalone lines, x 14 emoji
+    const bodies = CTA_ACTION.length * CTA_OBJECT.length + CTA_STANDALONE.length;
+    const [bi, ei2] = odometer(seed, [bodies, CTA_EMOJI.length], 619);
+    const body = bi < CTA_ACTION.length * CTA_OBJECT.length
+      ? CTA_ACTION[bi % CTA_ACTION.length] + CTA_OBJECT[Math.floor(bi / CTA_ACTION.length)]
+      : CTA_STANDALONE[bi - CTA_ACTION.length * CTA_OBJECT.length];
+    cta = `${body} ${CTA_EMOJI[ei2]}`;
+  } else {
+    desc = pick(long ? LONG_DESCS : SHORT_DESCS, seed, 7)(f);
+    cta = pick(CTAS, seed, 13);
+  }
 
   return `${s.ticker} — ${s.direction} ${long ? "🟢" : "🔴"}
 
@@ -736,7 +833,9 @@ function accountState(state, acct, nowMs) {
   if (!state.accounts) state.accounts = {};
   let a = state.accounts[acct];
   if (!a || a.date !== today) {
-    a = { date: today, count: 0, lastPostMs: a?.lastPostMs || 0 };
+    // seq is monotonic for the life of the account: it drives the non-repeating
+    // copy walk, so it must survive the daily quota reset.
+    a = { date: today, count: 0, lastPostMs: a?.lastPostMs || 0, seq: a?.seq || 0 };
     state.accounts[acct] = a;
   }
   return a;
@@ -892,7 +991,8 @@ async function runOnce(env, { dryRun = false, force = false } = {}) {
     const image = acct.images ? rawImage : null;
     const s = buildSetup(sig, CONFIG, acct.profile);
     // salt the seed per account so wording diverges even on the same signal
-    const text = render(s, sig.msgId + (acct.key === "b" ? 977 : 0));
+    a.seq = (a.seq || 0) + 1;
+    const text = render(s, a.seq);
 
     if (dryRun) {
       log.push(`[dry ${acct.label}] ${sig.symbol} ${s.direction}\nimage: ${image || "none"}\n${text}`);

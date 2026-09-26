@@ -3,7 +3,7 @@
 import { readFileSync } from "fs";
 import {
   parseCycloneRSI, parseMessage, parsePumpDetector,
-  buildSetup, render, extractPosts, chooseFor, targetGapMinutes,
+  buildSetup, render, extractPosts, chooseFor, targetGapMinutes, odometer,
 } from "./src/worker.js";
 
 const CFG = { entryZonePct: 0.5, stopLossPct: 7.0, takeProfitPcts: [4.0, 8.0, 12.0] };
@@ -226,6 +226,31 @@ for (let seed = 0; seed < 120; seed++) {
   aCtas.add(render(asA, seed).split("\n")[11]);
 }
 eq("account B has at least 20 CTAs", bCtas.size >= 18, true);
+
+// B's copy is COMPOSED and walked bijectively, so it does not repeat until the whole
+// space is exhausted. Random picking would collide around post 55 (birthday paradox).
+eq("odometer visits every combination before repeating",
+   new Set(Array.from({ length: 3584 }, (_, n) => odometer(n, [16, 16, 14], 1237).join(","))).size, 3584);
+eq("CTA odometer likewise",
+   new Set(Array.from({ length: 2380 }, (_, n) => odometer(n, [170, 14], 619).join(","))).size, 2380);
+function firstRepeat(line) {
+  const seen = new Set();
+  for (let s = 1; s <= 4000; s++) {
+    const k = render(asB, s).split("\n")[line];
+    if (seen.has(k)) return s;
+    seen.add(k);
+  }
+  return Infinity;
+}
+eq("B repeats no description inside 3,000 posts", firstRepeat(2) > 3000, true);
+eq("B repeats no CTA inside 2,000 posts", firstRepeat(11) > 2000, true);
+// consecutive posts must not share a slot value either
+const runA = render(asB, 101), runB = render(asB, 102);
+eq("consecutive descriptions differ", runA.split("\n")[2] === runB.split("\n")[2], false);
+eq("consecutive CTAs differ", runA.split("\n")[11] === runB.split("\n")[11], false);
+// the monotonic sequence must survive the daily quota reset, or copy would restart
+eq("seq is carried across the daily reset", /seq: a\?\.seq \|\| 0/.test(src), true);
+eq("seq increments per post", /a\.seq = \(a\.seq \|\| 0\) \+ 1;/.test(src), true);
 let sharedCta = 0;
 for (const c of bCtas) if (aCtas.has(c)) sharedCta++;
 eq("the two accounts never share a CTA", sharedCta, 0);
