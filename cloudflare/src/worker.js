@@ -53,9 +53,11 @@ const SOURCES = [{ key: "cyclonersi", channel: "CycloneRSI" }];
 
 // Two Binance Square profiles drawing from the same channel. Their API keys live in
 // GitHub secrets (the Worker never touches Binance directly), selected by this key.
+// Each profile publishes as its own Binance Square account, with its own level
+// maths, its own copy pools and its own image policy.
 const ACCOUNTS = [
-  { key: "a", label: "A" },
-  { key: "b", label: "B" },
+  { key: "a", label: "A", profile: "momentum", images: true },
+  { key: "b", label: "B", profile: "institutional", images: false },
 ];
 
 // Excluded assets: pegged coins, fiat tokens, gold-backed (PAXG/XAUT) and PEPE,
@@ -307,7 +309,10 @@ export function parsePumpDetector(text, msgId) {
  *   Oversold   / Extreme Oversold   / Bearish crossover -> SHORT
  * (The channel runs ~74% overbought, so expect a mostly-LONG feed.)
  */
-const RE_CY_HEAD = /\$?([A-Z0-9]+)\/([A-Z]+)\s*\(([^)]+)\)\s*(Extreme\s+)?(Overbought|Oversold|Bullish|Bearish)\b/i;
+// The condition is captured loosely rather than as a fixed set: pinning it to known
+// labels made the RSI fallback below unreachable, because an unlabelled alert failed
+// the match and returned before the thresholds were ever consulted.
+const RE_CY_HEAD = /\$?([A-Z0-9]+)\/([A-Z]+)\s*\(([^)]+)\)\s*([^\n]*)/;
 const RE_CY_PRICE = /Price:\s*([\d.,]+)/;
 const RE_CY_RSI = /RSI:\s*([\d.,]+)/;
 const RE_CY_EXCH = /\|\s*([A-Za-z]+)\s*\|/;
@@ -318,14 +323,15 @@ export function parseCycloneRSI(text, msgId) {
   const price = text.match(RE_CY_PRICE);
   if (!price) return null;
 
+  const condition = (head[4] || "").replace(/level reached/i, "").trim();
   const sig = {
     msgId,
     source: "cyclonersi",
     base: head[1].toUpperCase(),
     quote: head[2].toUpperCase(),
     timeframe: head[3].trim(),
-    extreme: Boolean(head[4]),
-    condition: (head[4] ? "Extreme " : "") + head[5],
+    extreme: /Extreme/i.test(condition),
+    condition,
   };
   sig.symbol = sig.base + sig.quote;
   sig.priceRaw = price[1].replace(/,/g, "");
@@ -337,8 +343,17 @@ export function parseCycloneRSI(text, msgId) {
   const ex = text.match(RE_CY_EXCH);
   sig.exchange = ex ? ex[1] : "";
 
-  // Momentum continuation: strength begets strength, weakness begets weakness.
-  const bullish = /Overbought|Bullish/i.test(head[5]);
+  // Direction: the alert's own label decides it, with the RSI thresholds as a
+  // fallback for anything unlabelled. RSI >= 65 is long, <= 35 is short; a reading
+  // between the two is no trade rather than a coin flip.
+  let bullish = null;
+  if (/Overbought|Bullish/i.test(condition)) bullish = true;
+  else if (/Oversold|Bearish/i.test(condition)) bullish = false;
+  else if (sig.rsi != null) {
+    if (sig.rsi >= 65) bullish = true;
+    else if (sig.rsi <= 35) bullish = false;
+  }
+  if (bullish === null) return null;
   sig.side = bullish ? "buy" : "sell";
   sig.direction = bullish ? "LONG" : "SHORT";
 
@@ -370,26 +385,47 @@ function withCommas(s) {
   return int.replace(/\B(?=(\d{3})+(?!\d))/g, ",") + (frac ? `.${frac}` : "");
 }
 
-export function buildSetup(sig, cfg) {
+/**
+ * Two level models.
+ *
+ * "momentum"      entry straddles price in the trade's direction and both the stop
+ *                 and targets are measured from the entry MIDPOINT.
+ * "institutional" entry sits on the favourable side of price (buy the dip, sell the
+ *                 bounce) and both the stop and targets are measured from the entry
+ *                 EXTREME nearest the market, which is the alert price itself.
+ */
+const LEVEL_RULES = {
+  momentum(p, long, cfg) {
+    const z = cfg.entryZonePct / 100;
+    const lo = long ? p : p * (1 - z);
+    const hi = long ? p * (1 + z) : p;
+    const anchor = (lo + hi) / 2;
+    return { lo, hi, anchor };
+  },
+  institutional(p, long, cfg) {
+    const z = cfg.entryZonePct / 100;
+    // LONG: P*0.995 .. P      SHORT: P .. P*1.005
+    const lo = long ? p * (1 - z) : p;
+    const hi = long ? p : p * (1 + z);
+    const anchor = long ? hi : lo; // the extreme nearest the market, i.e. P
+    return { lo, hi, anchor };
+  },
+};
+
+export function buildSetup(sig, cfg, profile = "momentum") {
   const p = sig.price;
   const long = sig.side === "buy";
 
-  // Entry range straddles the alert price in the direction of the trade:
-  //   LONG  -> price .. price * 1.005     SHORT -> price * 0.995 .. price
-  const z = cfg.entryZonePct / 100;
-  const lo = long ? p : p * (1 - z);
-  const hi = long ? p * (1 + z) : p;
-  const mid = (lo + hi) / 2;
+  const { lo, hi, anchor } = (LEVEL_RULES[profile] || LEVEL_RULES.momentum)(p, long, cfg);
 
-  // Stop and targets are both measured from the entry midpoint.
   const sl = cfg.stopLossPct / 100;
-  const stop = long ? mid * (1 - sl) : mid * (1 + sl);
-  const targets = cfg.takeProfitPcts.map((t) => (long ? mid * (1 + t / 100) : mid * (1 - t / 100)));
+  const stop = long ? anchor * (1 - sl) : anchor * (1 + sl);
+  const targets = cfg.takeProfitPcts.map((t) => (long ? anchor * (1 + t / 100) : anchor * (1 - t / 100)));
 
   const dec = precisionFor(p, sig.priceRaw);
   const f = (v) => withCommas(v.toFixed(dec));
-  const risk = Math.abs(mid - stop);
-  const reward = Math.abs((targets[1] ?? targets[0]) - mid);
+  const risk = Math.abs(anchor - stop);
+  const reward = Math.abs((targets[1] ?? targets[0]) - anchor);
 
   return {
     signal: sig,
@@ -401,6 +437,7 @@ export function buildSetup(sig, cfg) {
     targets: targets.map(f),
     rr: risk ? (reward / risk).toFixed(1) : "-",
     emoji: long ? "🟢" : "🔴",
+    profile,
   };
 }
 // ---------------------------------------------------------------- post text
@@ -512,6 +549,98 @@ const CTAS = [
   "Stay selective and let this one develop 🌊",
 ];
 
+// --- account B: institutional desk voice, no chart attached ---------------------
+// 28 descriptions per direction and 24 CTAs, so B never reads like A.
+
+const INST_LONG_DESCS = [
+  (f) => `Momentum has flipped decisively bullish on the ${f.tf} and order books are thinning above spot.`,
+  (f) => `Volume expansion is confirming the breakout structure, with buyers controlling every retest.`,
+  (f) => `Aggressive accumulation is showing through the tape — ${f.tf} RSI at ${f.rsi} and still climbing.`,
+  (f) => `Breakout structure is intact: resistance has flipped to support and demand is absorbing supply.`,
+  (f) => `Liquidity is rotating into this pair fast, and the ${f.tf} trend has turned firmly upward.`,
+  (f) => `Buy-side pressure is compounding while resting offers disappear — a textbook continuation profile.`,
+  (f) => `Institutional-sized bids are stepping in and momentum is expanding out of compression.`,
+  (f) => `${f.tf} RSI printed ${f.rsi}: strength is confirming, not exhausting, and volume backs the move.`,
+  (f) => `Order flow has turned one-sided to the bid, with each dip bought faster than the last.`,
+  (f) => `Breakout velocity is accelerating as thin overhead liquidity gives way to demand.`,
+  (f) => `The trend structure is clean — higher lows into resistance with volume confirming the push.`,
+  (f) => `Demand is overwhelming available supply and price is discovering higher levels on ${f.exch}.`,
+  (f) => `Momentum expansion underway: participation is rising and sellers are stepping aside.`,
+  (f) => `A decisive shift in order-flow favours longs, with the ${f.tf} structure turning constructive.`,
+  (f) => `Buyers are lifting every offer into a thinning book — continuation is the higher-probability path.`,
+  (f) => `Volume profile has tilted hard to the buy side, and the breakout is holding its retest.`,
+  (f) => `Sustained bid absorption at RSI ${f.rsi} points to real positioning rather than a squeeze.`,
+  (f) => `Trend acceleration on the ${f.tf} with momentum, volume and structure all pointing the same way.`,
+  (f) => `Supply overhead has been cleared and price is now trading in open air above prior resistance.`,
+  (f) => `Capital is rotating in aggressively — the ${f.tf} chart has broken out of its consolidation.`,
+  (f) => `Buy pressure is sustained rather than spiky, which is what separates continuation from a fakeout.`,
+  (f) => `Momentum is broadening across timeframes, with the ${f.tf} leading the expansion higher.`,
+  (f) => `The book is stacked bid-heavy and every pullback is being defended with size.`,
+  (f) => `Breakout confirmed on volume, with RSI ${f.rsi} signalling strength rather than exhaustion.`,
+  (f) => `Structure, flow and momentum are aligned bullish — a high-conviction continuation setup.`,
+  (f) => `Liquidity above is sparse and demand is persistent, a combination that tends to expand fast.`,
+  (f) => `Accumulation has matured into markup, with the ${f.tf} trend now firmly in control.`,
+  (f) => `Directional conviction is clear in the flow: buyers are paying up and sellers are absent.`,
+];
+
+const INST_SHORT_DESCS = [
+  (f) => `Momentum has rolled over decisively on the ${f.tf} and bid-side liquidity is evaporating.`,
+  (f) => `Volume expansion is confirming the breakdown structure, with sellers controlling every bounce.`,
+  (f) => `Aggressive distribution is showing through the tape — ${f.tf} RSI at ${f.rsi} and still falling.`,
+  (f) => `Breakdown structure is intact: support has flipped to resistance and supply is overwhelming demand.`,
+  (f) => `Liquidity is rotating out of this pair fast, and the ${f.tf} trend has turned firmly downward.`,
+  (f) => `Sell-side pressure is compounding while resting bids disappear — a textbook continuation lower.`,
+  (f) => `Institutional-sized offers are stepping in and momentum is breaking out of compression to the downside.`,
+  (f) => `${f.tf} RSI printed ${f.rsi}: weakness is confirming, not washing out, and volume backs the move.`,
+  (f) => `Order flow has turned one-sided to the offer, with each bounce sold faster than the last.`,
+  (f) => `Breakdown velocity is accelerating as thin support gives way to persistent supply.`,
+  (f) => `The trend structure is clean — lower highs into support with volume confirming the push down.`,
+  (f) => `Supply is overwhelming available demand and price is discovering lower levels on ${f.exch}.`,
+  (f) => `Momentum contraction underway: participation is rising and buyers are stepping aside.`,
+  (f) => `A decisive shift in order-flow favours shorts, with the ${f.tf} structure turning destructive.`,
+  (f) => `Sellers are hitting every bid into a thinning book — continuation lower is the higher-probability path.`,
+  (f) => `Volume profile has tilted hard to the sell side, and the breakdown is holding its retest.`,
+  (f) => `Sustained offer absorption at RSI ${f.rsi} points to real distribution rather than a flush.`,
+  (f) => `Trend acceleration on the ${f.tf} with momentum, volume and structure all pointing lower.`,
+  (f) => `Support beneath has been cleared and price is now trading in open air below prior demand.`,
+  (f) => `Capital is rotating out aggressively — the ${f.tf} chart has broken down from its consolidation.`,
+  (f) => `Sell pressure is sustained rather than spiky, which is what separates breakdown from a shakeout.`,
+  (f) => `Weakness is broadening across timeframes, with the ${f.tf} leading the move lower.`,
+  (f) => `The book is stacked offer-heavy and every bounce is being sold into with size.`,
+  (f) => `Breakdown confirmed on volume, with RSI ${f.rsi} signalling weakness rather than capitulation.`,
+  (f) => `Structure, flow and momentum are aligned bearish — a high-conviction continuation setup.`,
+  (f) => `Liquidity below is sparse and supply is persistent, a combination that tends to accelerate.`,
+  (f) => `Distribution has matured into markdown, with the ${f.tf} trend now firmly in control.`,
+  (f) => `Directional conviction is clear in the flow: sellers are hitting bids and buyers are absent.`,
+];
+
+const INST_CTAS = [
+  "Follow for more institutional-grade setups 🚀",
+  "Save this one and track it to target 📌",
+  "Share it with a trader who needs this 🤝",
+  "Follow along — more setups drop daily 📈",
+  "Bookmark this and watch the levels play out 🔖",
+  "Hit follow so you never miss the next call 🔔",
+  "Save it, trade it, review it 📊",
+  "Repost if this helped your positioning 🔁",
+  "Follow the desk for real-time structure reads 🧠",
+  "Keep this on your watchlist 👀",
+  "Drop a follow for daily market structure 💡",
+  "Share the setup, help someone trade better 🤲",
+  "Save for later and manage the risk 🛡️",
+  "Follow for clean levels, not noise ✨",
+  "Add it to your watchlist and stay ready ⚡",
+  "Follow for more high-conviction ideas 💎",
+  "Bookmark the levels before price moves 🏁",
+  "Share this with your trading group 📣",
+  "Follow for the next breakout before it runs 🚀",
+  "Save this and compare it to the close 🕐",
+  "Tap follow for structured trade plans 📗",
+  "Pass it on if you found it useful 🙌",
+  "Follow to catch the next rotation early 🌊",
+  "Save it — the levels do the talking ✅",
+];
+
 /**
  * Integer hash so each rotating slot is drawn independently.
  * A linear stride (seed * salt) makes the slots move in lockstep, which collapses the
@@ -530,8 +659,12 @@ const pick = (pool, seed, salt) => pool[hash32(Math.imul(seed, 0x9e3779b1) + Mat
 
 export function render(s, seed) {
   const long = s.direction === "LONG";
-  const desc = pick(long ? LONG_DESCS : SHORT_DESCS, seed, 7)(facts(s));
-  const cta = pick(CTAS, seed, 13);
+  const inst = s.profile === "institutional";
+  const descPool = inst
+    ? (long ? INST_LONG_DESCS : INST_SHORT_DESCS)
+    : (long ? LONG_DESCS : SHORT_DESCS);
+  const desc = pick(descPool, seed, 7)(facts(s));
+  const cta = pick(inst ? INST_CTAS : CTAS, seed, 13);
 
   return `${s.ticker} — ${s.direction} ${long ? "🟢" : "🔴"}
 
@@ -754,9 +887,11 @@ async function runOnce(env, { dryRun = false, force = false } = {}) {
       log.push(`${acct.label}: nothing new to post (all candidates already used)`);
       continue;
     }
-    const { sig, image } = chosen;
-    const s = buildSetup(sig, CONFIG);
-    // salt the seed per account so wording diverges even for a similar setup
+    const { sig, image: rawImage } = chosen;
+    // Account B publishes text only; A attaches the chart.
+    const image = acct.images ? rawImage : null;
+    const s = buildSetup(sig, CONFIG, acct.profile);
+    // salt the seed per account so wording diverges even on the same signal
     const text = render(s, sig.msgId + (acct.key === "b" ? 977 : 0));
 
     if (dryRun) {

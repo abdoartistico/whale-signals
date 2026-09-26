@@ -134,7 +134,7 @@ const any = Number(src.match(/minMinutesBetweenAnyPosts:\s*(\d+)/)[1]);
 const floor = Number(src.match(/minGapFloorMinutes:\s*(\d+)/)[1]);
 eq("per-account cap is under Binance's 100", cap < 100, true);
 eq("a cross-account gap is enforced", any > 0, true);
-eq("two accounts configured", (src.match(/\{ key: "[ab]", label: "[AB]" \}/g) || []).length, 2);
+eq("two accounts configured", (src.match(/\{ key: "[ab]", label: "[AB]",/g) || []).length, 2);
 
 // ---------------------------------------------------------------- pacing
 // A FIXED gap could never reach the quota: with a 2-minute cron the smallest real
@@ -182,6 +182,67 @@ eq("account B reaches its quota over a day", day.b.count >= cap - 2, true);
 eq("neither account exceeds the cap", day.a.count <= cap && day.b.count <= cap, true);
 const rough = simulateDay({ quiet: [[600, 690]] });
 eq("both recover from a 90-minute quiet spell", rough.a.count >= cap - 3 && rough.b.count >= cap - 3, true);
+
+// ---------------------------------------------------------------- account B
+// Institutional profile: entry on the favourable side of price, SL and TPs measured
+// from the entry EXTREME (which is the alert price), and no chart attached.
+const BL = buildSetup(parseCycloneRSI(cy("SOL", "Overbought", "100.00", "74.10"), 20), CFG, "institutional");
+near("B LONG entry low is P*0.995", num(BL.entryLow), 99.5);
+near("B LONG entry high is P", num(BL.entryHigh), 100);
+near("B LONG SL is entryHigh*0.93", num(BL.stop), 93, 0.01);
+near("B LONG TP1 is entryHigh*1.04", num(BL.targets[0]), 104, 0.01);
+near("B LONG TP2 is entryHigh*1.08", num(BL.targets[1]), 108, 0.01);
+near("B LONG TP3 is entryHigh*1.12", num(BL.targets[2]), 112, 0.01);
+
+const BS = buildSetup(parseCycloneRSI(cy("LINK", "Oversold", "100.00", "27.30"), 21), CFG, "institutional");
+near("B SHORT entry low is P", num(BS.entryLow), 100);
+near("B SHORT entry high is P*1.005", num(BS.entryHigh), 100.5);
+near("B SHORT SL is entryLow*1.07", num(BS.stop), 107, 0.01);
+near("B SHORT TP1 is entryLow*0.96", num(BS.targets[0]), 96, 0.01);
+near("B SHORT TP2 is entryLow*0.92", num(BS.targets[1]), 92, 0.01);
+near("B SHORT TP3 is entryLow*0.88", num(BS.targets[2]), 88, 0.01);
+eq("B entry range always ascends", num(BS.entryLow) < num(BS.entryHigh), true);
+
+// the two profiles must not produce identical levels on the same alert
+const sameSig = parseCycloneRSI(cy("SOL", "Overbought", "184.20", "74.10"), 22);
+const asA = buildSetup(sameSig, CFG, "momentum"), asB = buildSetup(sameSig, CFG, "institutional");
+eq("A and B price the same alert differently", asA.entryLow === asB.entryLow, false);
+
+// copy pools must be distinct between the accounts
+const aCopy = new Set(), bCopy = new Set();
+for (let seed = 0; seed < 120; seed++) {
+  aCopy.add(render(asA, seed).split("\n")[2]);
+  bCopy.add(render(asB, seed).split("\n")[2]);
+}
+eq("account A has its own descriptions", aCopy.size >= 15, true);
+eq("account B has its own descriptions", bCopy.size >= 20, true);
+let shared = 0;
+for (const line of bCopy) if (aCopy.has(line)) shared++;
+eq("the two accounts never share a description", shared, 0);
+
+const bCtas = new Set(), aCtas = new Set();
+for (let seed = 0; seed < 120; seed++) {
+  bCtas.add(render(asB, seed).split("\n")[11]);
+  aCtas.add(render(asA, seed).split("\n")[11]);
+}
+eq("account B has at least 20 CTAs", bCtas.size >= 18, true);
+let sharedCta = 0;
+for (const c of bCtas) if (aCtas.has(c)) sharedCta++;
+eq("the two accounts never share a CTA", sharedCta, 0);
+eq("B keeps the required layout", render(asB, 1).split("\n").length, 14);
+
+// image policy and profiles are declared per account
+eq("account A attaches charts", /key: "a", label: "A", profile: "momentum", images: true/.test(src), true);
+eq("account B posts text only", /key: "b", label: "B", profile: "institutional", images: false/.test(src), true);
+eq("the run loop honours the image flag", /const image = acct\.images \? rawImage : null;/.test(src), true);
+
+// RSI thresholds decide direction when the alert carries no label
+eq("RSI >= 65 with no label -> LONG",
+   parseCycloneRSI("$AAA/USDT (1h) Neutral level reached\nPrice: 10 | RSI: 66.0 | Binance | TV", 30)?.direction, "LONG");
+eq("RSI <= 35 with no label -> SHORT",
+   parseCycloneRSI("$AAA/USDT (1h) Neutral level reached\nPrice: 10 | RSI: 30.0 | Binance | TV", 31)?.direction, "SHORT");
+eq("a mid RSI with no label is no trade",
+   parseCycloneRSI("$AAA/USDT (1h) Neutral level reached\nPrice: 10 | RSI: 50.0 | Binance | TV", 32), null);
 
 // ---------------------------------------------------------------- images
 const HTML =
